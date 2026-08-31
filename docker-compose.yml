@@ -5,6 +5,7 @@ services:
       - .env
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
+      - ./reports:/home/appuser/app/reports
     tty: true
     stdin_open: true
 
@@ -24,6 +25,7 @@ services:
       - OLLAMA_BASE_URL=http://ollama:11434/v1
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
+      - ./reports:/home/appuser/app/reports
     depends_on:
       - ollama
     tty: true

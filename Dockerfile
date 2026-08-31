@@ -18,11 +18,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-RUN useradd --create-home appuser \
- && install -d -m 0755 -o appuser -g appuser /home/appuser/.tradingagents
-USER appuser
-WORKDIR /home/appuser/app
+# Install gosu for safe privilege dropping in the entrypoint script.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gosu \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home appuser
 
+WORKDIR /home/appuser/app
 COPY --from=builder --chown=appuser:appuser /build .
 
-ENTRYPOINT ["tradingagents"]
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Run as root so the entrypoint can fix volume ownership, then drop to appuser.
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["tradingagents"]
