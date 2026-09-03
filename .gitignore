@@ -232,4 +232,3 @@ reports/
 # Machine-local agent instructions and generated onboarding artifacts
 AGENTS.md
 CLAUDE.md
-docs/UA_ONBOARDING.md
