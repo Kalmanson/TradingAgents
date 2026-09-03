@@ -98,7 +98,7 @@ ipython_config.py
 #   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
 #   This is especially recommended for binary packages to ensure reproducibility, and is more
 #   commonly ignored for libraries.
-# uv.lock
+uv.lock
 
 # poetry
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
@@ -221,3 +221,15 @@ __marimo__/
 # Enterprise env file (secrets) and generated run reports
 .env.enterprise
 reports/
+
+# Local development tools and generated code-intelligence state
+.idea/
+.gitnexus/
+.ua/
+.claude/
+.DS_Store
+
+# Machine-local agent instructions and generated onboarding artifacts
+AGENTS.md
+CLAUDE.md
+docs/UA_ONBOARDING.md

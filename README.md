@@ -170,6 +170,21 @@ python -m cli.main     # alternative: run directly from source
 ```
 You will see a screen where you can select your desired tickers, analysis date, LLM provider, research depth, and more.
 
+### Local Web Workbench
+
+Install the optional Streamlit interface and launch it locally:
+
+```bash
+pip install ".[web]"
+tradingagents-web
+```
+
+The browser workbench runs on `127.0.0.1` and provides a Chinese UI for queued
+analysis runs, live agent/report progress, checkpoint-based recovery, and report
+history. API keys remain in `.env` or environment variables and are never shown
+or persisted by the interface. The existing `tradingagents` CLI remains
+available.
+
 ### Markets and tickers
 
 TradingAgents works with any market Yahoo Finance covers, using the exchange-suffixed ticker. Company identity and the alpha benchmark resolve automatically per market.

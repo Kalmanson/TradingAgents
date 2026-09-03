@@ -39,6 +39,9 @@ dev = [
     "pytest>=8.0",
     "pytest-subtests>=0.13",
 ]
+web = [
+    "streamlit>=1.37",
+]
 # Amazon Bedrock support (AWS SigV4 auth + boto3). Optional so the core install
 # stays lean: pip install "tradingagents[bedrock]".
 bedrock = [
@@ -47,6 +50,7 @@ bedrock = [
 
 [project.scripts]
 tradingagents = "cli.main:app"
+tradingagents-web = "tradingagents.web.launcher:main"
 
 [tool.setuptools.packages.find]
 include = ["tradingagents*", "cli*"]
