@@ -170,6 +170,14 @@ python -m cli.main     # alternative: run directly from source
 ```
 You will see a screen where you can select your desired tickers, analysis date, LLM provider, research depth, and more.
 
+### 按次付费股票报告网站
+
+可选的付费网站支持 Creem 收银台、11 种报告语言、订单关联的报告持久保存和邮件通知。
+安装 `pip install ".[mvp]"` 后运行 `tradingagents-mvp serve` 可在本地预览；默认关闭销售，域名、支付和邮件参数由服务器配置。
+
+中文文档：[系统架构](docs/付费报告系统架构.md) · [部署与运行](docs/付费报告部署与运行.md) · [文档入口](docs/PAID_REPORT_MVP.md)。
+部署文档包含订单离线查询、报告导出、数据库备份恢复和常见故障处理的完整命令。
+
 ### Local Web Workbench
 
 Install the optional Streamlit interface and launch it locally:

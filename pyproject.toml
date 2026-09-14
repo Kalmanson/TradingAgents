@@ -42,6 +42,13 @@ dev = [
 web = [
     "streamlit>=1.37",
 ]
+mvp = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "jinja2>=3.1,<4",
+    "markdown-it-py>=3,<5",
+    "nh3>=0.2,<1",
+]
 # Amazon Bedrock support (AWS SigV4 auth + boto3). Optional so the core install
 # stays lean: pip install "tradingagents[bedrock]".
 bedrock = [
@@ -51,12 +58,14 @@ bedrock = [
 [project.scripts]
 tradingagents = "cli.main:app"
 tradingagents-web = "tradingagents.web.launcher:main"
+tradingagents-mvp = "tradingagents.mvp.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["tradingagents*", "cli*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
+"tradingagents.mvp" = ["templates/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,7 +8,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /build
 COPY . .
-RUN pip install --no-cache-dir .
+ARG INSTALL_EXTRAS=""
+RUN if [ -n "$INSTALL_EXTRAS" ]; then pip install --no-cache-dir ".[${INSTALL_EXTRAS}]"; else pip install --no-cache-dir .; fi
 
 FROM python:3.12-slim
 

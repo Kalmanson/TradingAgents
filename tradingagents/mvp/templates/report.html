@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}{{ order.ticker }} report · Investment Committee{% endblock %}
+{% block content %}
+<header class="report-heading"><p class="eyebrow">AI INVESTMENT COMMITTEE REPORT</p><h1>{{ order.ticker }}</h1><p>Analysis date: {{ order.analysisDate }} <span>·</span> {{ language_label }}</p><p class="field-help">This report has been saved. Keep this private link to return to it.</p></header>
+<article class="report-content" lang="{{ order.language }}" dir="{{ 'rtl' if order.language == 'ar' else 'ltr' }}">{{ report_html | safe }}</article>
+<aside class="disclaimer">AI-generated research for information and education. It may contain errors or incomplete data. It is not personalized investment advice or a guarantee of returns.</aside>
+{% endblock %}

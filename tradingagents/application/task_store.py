@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -120,12 +121,13 @@ class TaskStore:
         *,
         source: str = "ui",
         parent_run_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> str:
         normalized = request.normalized()
         normalized.validate()
         run_id = uuid.uuid4().hex[:12]
-        with self._write_lock, self._connect() as connection:
-            connection.execute(
+        with self.transaction() if connection is None else nullcontext(connection) as conn:
+            conn.execute(
                 """
                 INSERT INTO runs (
                     id, parent_run_id, source, status, ticker, analysis_date,
@@ -143,6 +145,25 @@ class TaskStore:
                 ),
             )
         return run_id
+
+    @contextmanager
+    def transaction(self):
+        """Share an atomic write with application repositories using this database.
+
+        Callers passing this connection to create_run own commit/rollback. No
+        worker can claim that run until the surrounding transaction commits.
+        """
+        with self._write_lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                yield connection
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def clone_run(self, run_id: str, *, resume: bool) -> str:
         row = self.get_run(run_id)

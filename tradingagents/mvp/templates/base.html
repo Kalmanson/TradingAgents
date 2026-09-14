@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A complete AI investment committee perspective on your next stock. One report, one payment.">
+  <title>{% block title %}AI Investment Committee{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">IC</span><span>Investment<br><strong>Committee</strong></span></a>
+    <span class="header-note">Independent perspectives. One clear report.</span>
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+  <footer class="site-footer">
+    <span>AI-generated research. Your judgment comes first.</span>
+    <nav aria-label="Footer"><a href="/terms">Terms</a><a href="/privacy">Privacy</a>{% if support_email %}<a href="mailto:{{ support_email }}">Contact</a>{% endif %}</nav>
+  </footer>
+</body>
+</html>

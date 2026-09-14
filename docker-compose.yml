@@ -1,4 +1,32 @@
 services:
+  tradingagents-mvp:
+    build:
+      context: .
+      args:
+        INSTALL_EXTRAS: mvp
+    env_file:
+      - .env
+    environment:
+      COMMERCE_DATA_DIR: /home/appuser/.tradingagents/commerce
+    volumes:
+      - commerce_data:/home/appuser/.tradingagents
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: ["tradingagents-mvp", "serve", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    profiles: [mvp]
+
   tradingagents:
     build: .
     env_file:
@@ -34,5 +62,6 @@ services:
       - ollama
 
 volumes:
+  commerce_data:
   tradingagents_data:
   ollama_data:

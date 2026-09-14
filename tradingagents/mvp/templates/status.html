@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ order.ticker }} report status · Investment Committee{% endblock %}
+{% block content %}
+<section class="status-card" data-status-token="{{ status_token }}" data-order-state="{{ order.status }}">
+  <p class="eyebrow">YOUR {{ order.ticker }} REPORT</p>
+  <div class="status-icon" aria-hidden="true">◷</div>
+  <h1 id="status-title">{% if order.status == 'COMPLETED' %}Your report is ready.{% elif order.status == 'PENDING_PAYMENT' %}Waiting for payment confirmation.{% elif order.status == 'REFUNDED' %}This order has been refunded.{% elif order.status == 'FAILED' %}We couldn't complete your report.{% else %}Payment received. Preparing your report.{% endif %}</h1>
+  <p id="status-description">{% if order.status == 'COMPLETED' %}Your report is saved. We will also send the link to your checkout email.{% elif order.status == 'FAILED' %}Our team will review the order and arrange a refund. You do not need to pay again.{% elif order.status == 'REFUNDED' %}Report access is no longer available for this order.{% elif order.status == 'PENDING_PAYMENT' %}This page updates after our payment service confirms your purchase.{% else %}The committee is working through the evidence. You can close this page; we'll email your private report link when it's ready.{% endif %}</p>
+  <a id="view-report" class="primary-button" {% if order.reportUrl %}href="{{ order.reportUrl }}"{% else %}hidden{% endif %}>View report <span aria-hidden="true">↗</span></a>
+  {% if support_email %}<p class="support-note">Need help? <a href="mailto:{{ support_email }}">Contact us</a> and include this page's URL.</p>{% endif %}
+  <p id="poll-notice" class="field-help" aria-live="polite"></p>
+</section>
+{% endblock %}
