@@ -41,12 +41,20 @@ class CommerceSettings:
     sales_enabled: bool = False
     max_pending_runs: int = 3
     stalled_after_seconds: int = 1800
+    checkout_rate_limit: int = 5
+    read_rate_limit: int = 60
+    recaptcha_enabled: bool = True
+    recaptcha_site_key: str = ""
+    recaptcha_secret_key: str = field(default="", repr=False)
 
     @classmethod
     def from_env(cls) -> CommerceSettings:
         flag = os.getenv("COMMERCE_SALES_ENABLED", "false").lower()
         if flag not in {"true", "false", "1", "0"}:
             raise ValueError("COMMERCE_SALES_ENABLED must be true or false")
+        captcha_flag = os.getenv("COMMERCE_RECAPTCHA_ENABLED", "true").lower()
+        if captcha_flag not in {"true", "false", "1", "0"}:
+            raise ValueError("COMMERCE_RECAPTCHA_ENABLED must be true or false")
         settings = cls(
             data_dir=Path(os.getenv("COMMERCE_DATA_DIR", str(Path.home() / ".tradingagents/commerce"))).expanduser().resolve(),
             public_url=os.getenv("COMMERCE_PUBLIC_URL", "http://localhost:8000").rstrip("/"),
@@ -60,6 +68,11 @@ class CommerceSettings:
             sales_enabled=flag in {"true", "1"},
             max_pending_runs=int(os.getenv("COMMERCE_MAX_PENDING_RUNS", "3")),
             stalled_after_seconds=int(os.getenv("COMMERCE_STALLED_AFTER_SECONDS", "1800")),
+            checkout_rate_limit=int(os.getenv("COMMERCE_CHECKOUT_RATE_LIMIT", "5")),
+            read_rate_limit=int(os.getenv("COMMERCE_READ_RATE_LIMIT", "60")),
+            recaptcha_enabled=captcha_flag in {"true", "1"},
+            recaptcha_site_key=os.getenv("RECAPTCHA_SITE_KEY", "").strip(),
+            recaptcha_secret_key=os.getenv("RECAPTCHA_SECRET_KEY", "").strip(),
         )
         settings.validate()
         return settings
@@ -77,6 +90,15 @@ class CommerceSettings:
             raise ValueError("This product is fixed at USD 5.99, tax inclusive")
         if self.max_pending_runs < 1 or self.stalled_after_seconds < 60:
             raise ValueError("Invalid queue capacity or stalled-run threshold")
+        if self.checkout_rate_limit < 1 or self.read_rate_limit < 1:
+            raise ValueError("Request rate limits must be positive integers")
+        if self.creem_mode == "prod":
+            if not self.recaptcha_enabled:
+                raise ValueError("Production requires reCAPTCHA verification")
+            # Google's public v2 test keys always pass; never accept them in production.
+            if (self.recaptcha_site_key == "6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"
+                    or self.recaptcha_secret_key == "6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe"):
+                raise ValueError("Production requires real reCAPTCHA keys")
         if any("\n" in x or "\r" in x for x in (self.email_from, self.support_email)):
             raise ValueError("Email settings must not contain newlines")
 
@@ -89,4 +111,9 @@ class CommerceSettings:
             "COMMERCE_EMAIL_FROM": self.email_from,
             "COMMERCE_SUPPORT_EMAIL": self.support_email,
         }
+        if self.recaptcha_enabled:
+            fields.update({
+                "RECAPTCHA_SITE_KEY": self.recaptcha_site_key,
+                "RECAPTCHA_SECRET_KEY": self.recaptcha_secret_key,
+            })
         return [name for name, value in fields.items() if not value]

@@ -20,6 +20,12 @@
       <select id="language" name="language">{% for code, language in languages.items() %}<option value="{{ code }}">{{ language[1] }}</option>{% endfor %}</select>
       <p class="field-help">Your selected language is saved with your order.</p>
       <div class="price-line"><div><span class="price">$5.99</span><span class="currency">USD</span></div><span>One report<br>Tax included</span></div>
+      {% if available and recaptcha_site_key %}
+      <div class="captcha-field">
+        <div id="purchase-captcha" data-sitekey="{{ recaptcha_site_key }}"></div>
+        <p id="captcha-notice" class="field-help" aria-live="polite">Loading human verification…</p>
+      </div>
+      {% endif %}
       <button class="primary-button" id="purchase-button" type="submit" {% if not available %}disabled{% endif %}>{% if available %}Generate report — $5.99 <span aria-hidden="true">↗</span>{% else %}Report purchases opening soon{% endif %}</button>
       <p id="purchase-error" class="error-message" role="alert" hidden></p>
       <p class="checkout-note">Secure payment with Creem. Enter your email at checkout; your private report link arrives there.</p>

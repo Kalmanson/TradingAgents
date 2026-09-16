@@ -20,6 +20,7 @@ from markdown_it import MarkdownIt
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
+from tradingagents.commerce.captcha import CaptchaRejected, CaptchaUnavailable, verify_recaptcha
 from tradingagents.commerce.config import LANGUAGES, TOKEN_PATTERN, CommerceSettings
 from tradingagents.commerce.creem import PaymentRejected, ProviderUnavailable, verify_signature
 from tradingagents.commerce.service import CommerceRuntime, CommerceService
@@ -32,6 +33,7 @@ class PurchaseInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     ticker: str = Field(min_length=1, max_length=10)
     language: str = Field(default="en", min_length=2, max_length=8)
+    recaptcha_token: str = Field(default="", max_length=4096, repr=False)
 
 
 class RateLimiter:
@@ -84,22 +86,31 @@ def create_app(settings: CommerceSettings | None = None, *, service: CommerceSer
     async def boundaries(request: Request, call_next):
         path = request.url.path
         client = request.client.host if request.client else "unknown"
-        limit = 5 if path == "/api/orders" else 60
+        limit = settings.checkout_rate_limit if path == "/api/orders" else settings.read_rate_limit
         category = "checkout" if path == "/api/orders" else "read"
+        response = None
         if path.startswith(("/api/orders", "/report/", "/success/")) and not limiter.allow((client, category), limit):
-            return JSONResponse({"detail": "Too many requests. Please try again shortly."}, status_code=429, headers={"Retry-After": "60"})
-        if path == "/api/orders" and request.method == "POST":
+            response = JSONResponse({"detail": "Too many requests. Please wait 60 seconds before trying again."}, status_code=429, headers={"Retry-After": "60"})
+        elif path == "/api/orders" and request.method == "POST":
             origin = request.headers.get("origin")
             if origin and origin != settings.public_url:
-                return JSONResponse({"detail": "Origin not allowed."}, status_code=403)
-            if request.headers.get("content-type", "").split(";")[0] != "application/json":
-                return JSONResponse({"detail": "Expected application/json."}, status_code=415)
-        response = await call_next(request)
+                response = JSONResponse({"detail": "Origin not allowed."}, status_code=403)
+            elif request.headers.get("content-type", "").split(";")[0] != "application/json":
+                response = JSONResponse({"detail": "Expected application/json."}, status_code=415)
+        if response is None:
+            response = await call_next(request)
+        script_src = "'self'"
+        frame_src = "'none'"
+        connect_src = "'self'"
+        if path == "/" and settings.recaptcha_enabled:
+            script_src += " https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/"
+            frame_src = "https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/"
+            connect_src += " https://www.google.com/recaptcha/"
         response.headers.update({
             "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
             "X-Frame-Options": "DENY",
-            "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+            "Content-Security-Policy": f"default-src 'self'; script-src {script_src}; style-src 'self'; img-src 'self'; connect-src {connect_src}; frame-src {frame_src}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
         })
         if path.startswith(("/api", "/report", "/success")):
             response.headers["Cache-Control"] = "no-store"
@@ -114,6 +125,7 @@ def create_app(settings: CommerceSettings | None = None, *, service: CommerceSer
                      and service.store.capacity_available() and (not start_workers or runtime.healthy()))
         return templates.TemplateResponse(request=request, name="index.html", context={
             "languages": LANGUAGES, "available": available, "support_email": settings.support_email,
+            "recaptcha_site_key": settings.recaptcha_site_key if settings.recaptcha_enabled else "",
         })
 
     @app.post("/api/orders")
@@ -121,14 +133,23 @@ def create_app(settings: CommerceSettings | None = None, *, service: CommerceSer
         chunks = bytearray()
         async for chunk in request.stream():
             chunks.extend(chunk)
-            if len(chunks) > 4096:
+            if len(chunks) > 8192:
                 raise HTTPException(413, "Request too large.")
         try:
             inputs = PurchaseInput.model_validate_json(chunks)
         except ValueError:
-            raise HTTPException(422, "Provide a ticker and report language only.") from None
+            raise HTTPException(422, "Provide a valid ticker, report language and verification token.") from None
         if start_workers and not runtime.healthy():
             raise HTTPException(503, "Report generation is temporarily unavailable.")
+        if not settings.sales_enabled or settings.missing_configuration():
+            raise HTTPException(503, "Report purchases are not available yet.")
+        if settings.recaptcha_enabled:
+            try:
+                await run_in_threadpool(verify_recaptcha, inputs.recaptcha_token, settings)
+            except CaptchaRejected as exc:
+                raise HTTPException(403, str(exc)) from None
+            except CaptchaUnavailable as exc:
+                raise HTTPException(503, str(exc)) from None
         try:
             order = await run_in_threadpool(service.create_checkout, inputs.ticker, inputs.language, idempotency_key)
         except PaymentRejected:

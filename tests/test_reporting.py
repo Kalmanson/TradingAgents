@@ -289,7 +289,7 @@ def commerce(tmp_path):
         data_dir=tmp_path / "commerce", public_url="http://testserver", product_id="prod_report",
         creem_api_key="merchant-test-key", webhook_secret="webhook-test-secret",
         resend_api_key="resend-test-key", email_from="reports@example.com",
-        support_email="support@example.com", sales_enabled=True,
+        support_email="support@example.com", sales_enabled=True, recaptcha_enabled=False,
     )
 
     class Transport:
@@ -844,3 +844,253 @@ main(["serve", "--log-level", "info"])
     assert result.stdout == "ok\nok\n"
     assert result.stderr.count("event=smoke") == 2
     assert "INFO tradingagents.commerce.service" in result.stderr
+
+
+@pytest.fixture
+def protected_storefront(commerce, monkeypatch):
+    from dataclasses import replace
+    from unittest.mock import Mock
+
+    from fastapi.testclient import TestClient
+
+    from tradingagents.commerce import captcha
+    from tradingagents.mvp.app import create_app
+
+    settings = replace(commerce.settings, recaptcha_enabled=True,
+                       recaptcha_site_key="site-key", recaptcha_secret_key="private-captcha-secret")
+    commerce.service.settings = settings
+    verification = Mock(return_value=SimpleNamespace(
+        status_code=200, json=lambda: {"success": True, "hostname": "testserver"},
+    ))
+    monkeypatch.setattr(captcha.requests, "post", verification)
+    with TestClient(create_app(settings, service=commerce.service, start_workers=False)) as client:
+        yield SimpleNamespace(commerce=commerce, settings=settings, client=client, verification=verification)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("payload,expected", [
+    ({}, 403), ({"recaptcha_token": " "}, 403),
+    ({"recaptcha_token": "x" * 4097}, 422), ({"recaptcha_token": None}, 422),
+    ({"recaptcha_token": "token", "price": 1}, 422),
+])
+def test_checkout_cannot_bypass_captcha(protected_storefront, payload, expected):
+    c = protected_storefront
+    response = c.client.post("/api/orders", json={"ticker": "AAPL", **payload},
+                             headers={"Idempotency-Key": "a" * 32})
+    assert response.status_code == expected
+    c.verification.assert_not_called()
+    assert not c.commerce.validated and not c.commerce.transport.requests
+    assert c.commerce.store.get_order("a" * 32, by="idempotency_key") is None
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("result,status", [
+    ({"success": False, "error-codes": ["invalid-input-response"]}, 403),
+    ({"success": False, "error-codes": ["timeout-or-duplicate"]}, 403),
+    ({"success": True, "hostname": "attacker.example"}, 403),
+    ({"success": True}, 403),
+    ({"success": "true", "hostname": "testserver"}, 503),
+    ({"success": False, "error-codes": ["invalid-input-secret"]}, 503),
+    ({"success": True, "hostname": "testserver", "error-codes": "bad-shape"}, 503),
+    ([], 503),
+])
+def test_captcha_rejections_have_no_checkout_side_effects(protected_storefront, result, status):
+    c = protected_storefront
+    c.verification.return_value = SimpleNamespace(status_code=200, json=lambda: result)
+    response = c.client.post("/api/orders", json={"ticker": "AAPL", "recaptcha_token": "private-token"},
+                             headers={"Idempotency-Key": "a" * 32})
+    assert response.status_code == status
+    assert "private" not in response.text
+    assert not c.commerce.validated and not c.commerce.transport.requests
+    assert c.commerce.store.get_order("a" * 32, by="idempotency_key") is None
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failure", ["timeout", "invalid_json", "http_error"])
+def test_captcha_provider_failure_stops_checkout(protected_storefront, failure):
+    from unittest.mock import Mock
+
+    import requests
+
+    c = protected_storefront
+    if failure == "timeout":
+        c.verification.side_effect = requests.ReadTimeout("private upstream details")
+    elif failure == "invalid_json":
+        c.verification.return_value = SimpleNamespace(status_code=200, json=Mock(side_effect=ValueError("private")))
+    else:
+        c.verification.return_value.status_code = 503
+    response = c.client.post("/api/orders", json={"ticker": "AAPL", "recaptcha_token": "private-token"},
+                             headers={"Idempotency-Key": "a" * 32})
+    assert response.status_code == 503
+    assert "private" not in response.text
+    assert c.verification.call_count == 1
+    assert not c.commerce.transport.requests
+    assert c.commerce.store.get_order("a" * 32, by="idempotency_key") is None
+
+
+@pytest.mark.integration
+def test_verified_checkout_retries_reuse_order_and_webhooks_need_no_captcha(protected_storefront):
+    c = protected_storefront
+    responses = []
+    for token in ("first-private-token", "fresh-private-token"):
+        response = c.client.post("/api/orders", json={"ticker": "AAPL", "recaptcha_token": token},
+                                 headers={"Idempotency-Key": "a" * 32})
+        assert response.status_code == 200, response.text
+        responses.append(response.json())
+        c.verification.assert_called_with(
+            "https://www.google.com/recaptcha/api/siteverify",
+            data={"secret": c.settings.recaptcha_secret_key, "response": token},
+            timeout=(3.05, 5), allow_redirects=False,
+        )
+    assert responses[0] == responses[1]
+    assert len(c.commerce.transport.checkouts) == 1
+    order = c.commerce.store.get_order("a" * 32, by="idempotency_key")
+    assert "private-token" not in str(order)
+    assert "recaptcha" not in order["params_json"]
+    assert "private-captcha-secret" not in repr(c.settings)
+    assert not c.commerce.store.tasks.list_runs()
+    # Exercise the protected app with the same signed notification as the payment fixture.
+    event_response = c.commerce.post_event(c.commerce.event(order))
+    webhook = c.client.post("/api/webhooks/creem", content=event_response.request.content,
+                            headers=dict(event_response.request.headers))
+    assert webhook.status_code == 200
+    assert len(c.commerce.store.tasks.list_runs()) == 1
+    assert c.verification.call_count == 2
+
+
+@pytest.mark.integration
+def test_captcha_page_and_csp_are_scoped_to_purchase(protected_storefront):
+    c = protected_storefront
+    page = c.client.get("/")
+    assert 'id="purchase-captcha" data-sitekey="site-key"' in page.text
+    assert "private-captcha-secret" not in page.text
+    assert "https://www.google.com/recaptcha/" in page.headers["Content-Security-Policy"]
+    assert "unsafe-inline" not in page.headers["Content-Security-Policy"]
+    policy = c.client.get("/privacy")
+    assert "Google reCAPTCHA" in policy.text
+    assert "google.com/recaptcha/" not in policy.headers["Content-Security-Policy"]
+    assert 'id="purchase-captcha"' not in policy.text
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("missing", ["recaptcha_site_key", "recaptcha_secret_key"])
+def test_missing_captcha_configuration_closes_sales(protected_storefront, missing):
+    from dataclasses import replace
+
+    from fastapi.testclient import TestClient
+
+    from tradingagents.mvp.app import create_app
+
+    c = protected_storefront
+    settings = replace(c.settings, **{missing: ""})
+    with TestClient(create_app(settings, service=c.commerce.service, start_workers=False)) as client:
+        home = client.get("/")
+        assert "Report purchases opening soon" in home.text
+        assert 'id="purchase-captcha"' not in home.text
+        assert not client.get("/health/ready").json()["acceptingOrders"]
+        response = client.post("/api/orders", json={"ticker": "AAPL", "recaptcha_token": "token"})
+        assert response.status_code == 503
+    c.verification.assert_not_called()
+    assert not c.commerce.transport.requests
+
+
+@pytest.mark.integration
+def test_configured_rate_limits_isolate_ips_and_checkout_from_reads(commerce):
+    from dataclasses import replace
+
+    from fastapi.testclient import TestClient
+
+    from tradingagents.mvp.app import create_app
+
+    settings = replace(commerce.settings, checkout_rate_limit=2, read_rate_limit=3)
+    app = create_app(settings, service=commerce.service, start_workers=False)
+    with TestClient(app) as client, TestClient(app, client=("198.51.100.2", 50000)) as other:
+        for _ in range(2):
+            assert client.post("/api/orders", json={"ticker": "AAPL"}).status_code == 422
+        limited = client.post("/api/orders", json={"ticker": "AAPL"})
+        assert limited.status_code == 429
+        assert limited.headers["Retry-After"] == "60"
+        assert limited.headers["Cache-Control"] == "no-store"
+        assert limited.headers["X-Frame-Options"] == "DENY"
+        assert other.post("/api/orders", json={"ticker": "AAPL"}).status_code == 422
+        for path in ("/api/orders/status/invalid", "/success/invalid", "/report/invalid"):
+            assert client.get(path).status_code == 404
+        assert client.get("/report/invalid").status_code == 429
+        assert other.get("/report/invalid").status_code == 404
+        assert client.get("/health/live").status_code == 200
+        assert client.post("/api/webhooks/creem", content=b"{}").status_code == 401
+
+
+def test_rate_limit_window_recovers(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("nh3")
+    from tradingagents.mvp import app
+
+    limiter = app.RateLimiter()
+    monkeypatch.setattr(app.time, "monotonic", lambda: 100)
+    assert limiter.allow(("client", "checkout"), 1)
+    assert not limiter.allow(("client", "checkout"), 1)
+    monkeypatch.setattr(app.time, "monotonic", lambda: 159.9)
+    assert not limiter.allow(("client", "checkout"), 1)
+    monkeypatch.setattr(app.time, "monotonic", lambda: 160)
+    assert limiter.allow(("client", "checkout"), 1)
+
+
+def test_security_configuration_from_environment(monkeypatch):
+    from tradingagents.commerce.config import CommerceSettings
+
+    monkeypatch.setenv("CREEM_MODE", "test")
+    monkeypatch.setenv("COMMERCE_PUBLIC_URL", "http://localhost:8000")
+    for name in ("COMMERCE_RECAPTCHA_ENABLED", "COMMERCE_CHECKOUT_RATE_LIMIT", "COMMERCE_READ_RATE_LIMIT"):
+        monkeypatch.delenv(name, raising=False)
+    defaults = CommerceSettings.from_env()
+    assert defaults.recaptcha_enabled
+    assert (defaults.checkout_rate_limit, defaults.read_rate_limit) == (5, 60)
+    monkeypatch.setenv("COMMERCE_CHECKOUT_RATE_LIMIT", "2")
+    monkeypatch.setenv("COMMERCE_READ_RATE_LIMIT", "30")
+    monkeypatch.setenv("RECAPTCHA_SITE_KEY", " site ")
+    monkeypatch.setenv("RECAPTCHA_SECRET_KEY", " secret ")
+    configured = CommerceSettings.from_env()
+    assert (configured.checkout_rate_limit, configured.read_rate_limit) == (2, 30)
+    assert (configured.recaptcha_site_key, configured.recaptcha_secret_key) == ("site", "secret")
+    for name, value in (("COMMERCE_CHECKOUT_RATE_LIMIT", "0"), ("COMMERCE_READ_RATE_LIMIT", "-1"),
+                        ("COMMERCE_CHECKOUT_RATE_LIMIT", "1.5"), ("COMMERCE_RECAPTCHA_ENABLED", "yes")):
+        with monkeypatch.context() as context:
+            context.setenv(name, value)
+            with pytest.raises(ValueError):
+                CommerceSettings.from_env()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"recaptcha_enabled": False},
+    {"recaptcha_site_key": "6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"},
+    {"recaptcha_secret_key": "6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe"},
+])
+def test_production_rejects_captcha_bypass_settings(overrides):
+    from tradingagents.commerce.config import CommerceSettings
+
+    settings = CommerceSettings(creem_mode="prod", public_url="https://reports.example.com", **overrides)
+    with pytest.raises(ValueError, match="Production requires"):
+        settings.validate()
+
+
+@pytest.mark.integration
+def test_rate_limit_precedes_captcha_network_call(protected_storefront):
+    c = protected_storefront
+    c.verification.return_value = SimpleNamespace(status_code=200, json=lambda: {"success": False})
+    for _ in range(c.settings.checkout_rate_limit):
+        assert c.client.post("/api/orders", json={"ticker": "AAPL", "recaptcha_token": "invalid"}).status_code == 403
+    assert c.client.post("/api/orders", json={"ticker": "AAPL", "recaptcha_token": "invalid"}).status_code == 429
+    assert c.verification.call_count == c.settings.checkout_rate_limit
+    assert not c.commerce.transport.requests
+
+
+@pytest.mark.integration
+def test_captcha_request_size_boundaries(protected_storefront):
+    c = protected_storefront
+    too_large = c.client.post("/api/orders", content=b" " * 8193, headers={"Content-Type": "application/json"})
+    assert too_large.status_code == 413
+    c.verification.assert_not_called()
+    accepted = c.client.post("/api/orders", json={"ticker": "AAPL", "recaptcha_token": "x" * 4096},
+                             headers={"Idempotency-Key": "a" * 32})
+    assert accepted.status_code == 200
