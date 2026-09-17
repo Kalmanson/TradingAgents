@@ -24,6 +24,8 @@ def main(argv=None) -> None:
     serve = commands.add_parser("serve", help="Start one HTTP server and durable worker")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--mode", choices=("test", "prod"),
+                       help="选择 Creem 测试或生产配置，优先于 CREEM_MODE；两者均未设置时使用 test")
     serve.add_argument("--log-level", choices=("debug", "info", "warning", "error"), default="info",
                        help="业务和服务器日志级别，默认 info")
     orders = commands.add_parser("orders", help="List saved orders without network calls")
@@ -47,6 +49,14 @@ def main(argv=None) -> None:
     if args.data_dir:
         os.environ["COMMERCE_DATA_DIR"] = str(args.data_dir.expanduser().resolve())
     if args.command == "serve":
+        from tradingagents.commerce.config import CommerceSettings
+
+        if args.mode:
+            os.environ["CREEM_MODE"] = args.mode
+        try:
+            CommerceSettings.from_env()
+        except ValueError as exc:
+            parser.error(str(exc))
         os.umask(0o077)
         import uvicorn
         from uvicorn.config import LOGGING_CONFIG

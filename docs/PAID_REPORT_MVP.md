@@ -12,7 +12,7 @@
 ## 目前能做什么
 
 - 首页选择美股代码及 11 种报告语言。
-- 单一产品，一份报告固定为含税 5.99 美元；用户无需注册或登录。
+- 单一一次性产品，价格、币种和税费方式从 Creem 读取；用户无需注册或登录。
 - 通过服务端验证过的支付通知启动后台分析，浏览器跳转不能充当支付凭证。
 - 报告正文同时保存到 Markdown 文件和 SQLite 数据库，并与订单关联。
 - 用随机私密链接查看报告，用命令行离线查询订单、导出报告和备份数据库。
@@ -20,18 +20,16 @@
 
 ## 你当前可以先做的事
 
-域名、Creem 和 Resend 尚未配置时，可以先运行首页预览。保持 `COMMERCE_SALES_ENABLED=false`，后续通过 `COMMERCE_PUBLIC_URL` 填写正式域名。
+先在同一个 `.env` 中填写 `CREEM_TEST_*`、`CREEM_PROD_*` 两组 Creem 配置，以及共用的网站、邮件、人机验证和模型配置。只需填齐本次启动模式的 Creem 凭据；缺少必填项会直接拒绝启动并列出变量名。
 
 在当前电脑的项目目录中运行：
 
 ```sh
 cd /Users/chengshuo/PycharmProjects/TradingAgents
 COMMERCE_PUBLIC_URL=http://localhost:8000 \
-COMMERCE_SALES_ENABLED=false \
-CREEM_MODE=test \
-.venv/bin/tradingagents-mvp serve
+.venv/bin/tradingagents-mvp serve --mode test
 ```
 
-然后打开 [本地首页](http://localhost:8000)。按 `Ctrl+C` 停止。若是新机器或尚未安装依赖，先按[部署与运行文档](付费报告部署与运行.md)完成安装。
+然后打开 [本地首页](http://localhost:8000)。正式环境使用 `serve --mode prod` 并配置 HTTPS 网站地址；不传 `--mode` 时读取 `CREEM_MODE`，缺省为 `test`。按 `Ctrl+C` 停止。若是新机器或尚未安装依赖，先按[部署与运行文档](付费报告部署与运行.md)完成安装。
 
 代码已完成本地验证；真实支付、真实模型运行和邮件收件的完整联调仍需使用你实际配置的服务完成。本地测试通过，不代表域名、商户账户或发信域名已配置成功。

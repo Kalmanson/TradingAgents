@@ -31,14 +31,11 @@ class CommerceSettings:
     public_url: str = "http://localhost:8000"
     creem_mode: str = "test"
     product_id: str = ""
-    amount: int = 599
-    currency: str = "USD"
     creem_api_key: str = field(default="", repr=False)
     webhook_secret: str = field(default="", repr=False)
     resend_api_key: str = field(default="", repr=False)
     email_from: str = ""
     support_email: str = ""
-    sales_enabled: bool = False
     max_pending_runs: int = 3
     stalled_after_seconds: int = 1800
     checkout_rate_limit: int = 5
@@ -49,23 +46,23 @@ class CommerceSettings:
 
     @classmethod
     def from_env(cls) -> CommerceSettings:
-        flag = os.getenv("COMMERCE_SALES_ENABLED", "false").lower()
-        if flag not in {"true", "false", "1", "0"}:
-            raise ValueError("COMMERCE_SALES_ENABLED must be true or false")
+        mode = os.getenv("CREEM_MODE", "test").strip().lower()
+        if mode not in {"test", "prod"}:
+            raise ValueError("CREEM_MODE must be test or prod")
+        prefix = f"CREEM_{mode.upper()}"
         captcha_flag = os.getenv("COMMERCE_RECAPTCHA_ENABLED", "true").lower()
         if captcha_flag not in {"true", "false", "1", "0"}:
             raise ValueError("COMMERCE_RECAPTCHA_ENABLED must be true or false")
         settings = cls(
             data_dir=Path(os.getenv("COMMERCE_DATA_DIR", str(Path.home() / ".tradingagents/commerce"))).expanduser().resolve(),
             public_url=os.getenv("COMMERCE_PUBLIC_URL", "http://localhost:8000").rstrip("/"),
-            creem_mode=os.getenv("CREEM_MODE", "test"),
-            product_id=os.getenv("CREEM_PRODUCT_ID", ""),
-            creem_api_key=os.getenv("CREEM_API_KEY", ""),
-            webhook_secret=os.getenv("CREEM_WEBHOOK_SECRET", ""),
+            creem_mode=mode,
+            product_id=os.getenv(f"{prefix}_PRODUCT_ID", "").strip(),
+            creem_api_key=os.getenv(f"{prefix}_API_KEY", "").strip(),
+            webhook_secret=os.getenv(f"{prefix}_WEBHOOK_SECRET", "").strip(),
             resend_api_key=os.getenv("RESEND_API_KEY", ""),
             email_from=os.getenv("COMMERCE_EMAIL_FROM", ""),
             support_email=os.getenv("COMMERCE_SUPPORT_EMAIL", ""),
-            sales_enabled=flag in {"true", "1"},
             max_pending_runs=int(os.getenv("COMMERCE_MAX_PENDING_RUNS", "3")),
             stalled_after_seconds=int(os.getenv("COMMERCE_STALLED_AFTER_SECONDS", "1800")),
             checkout_rate_limit=int(os.getenv("COMMERCE_CHECKOUT_RATE_LIMIT", "5")),
@@ -86,8 +83,6 @@ class CommerceSettings:
             raise ValueError("CREEM_MODE must be test or prod")
         if self.creem_mode == "prod" and url.scheme != "https":
             raise ValueError("Production requires an HTTPS public URL")
-        if self.amount != 599 or self.currency != "USD":
-            raise ValueError("This product is fixed at USD 5.99, tax inclusive")
         if self.max_pending_runs < 1 or self.stalled_after_seconds < 60:
             raise ValueError("Invalid queue capacity or stalled-run threshold")
         if self.checkout_rate_limit < 1 or self.read_rate_limit < 1:
@@ -101,12 +96,16 @@ class CommerceSettings:
                 raise ValueError("Production requires real reCAPTCHA keys")
         if any("\n" in x or "\r" in x for x in (self.email_from, self.support_email)):
             raise ValueError("Email settings must not contain newlines")
+        missing = self.missing_configuration()
+        if missing:
+            raise ValueError(f"Missing configuration for Creem {self.creem_mode} mode: {', '.join(missing)}")
 
     def missing_configuration(self) -> list[str]:
+        prefix = f"CREEM_{self.creem_mode.upper()}"
         fields = {
-            "CREEM_PRODUCT_ID": self.product_id,
-            "CREEM_API_KEY": self.creem_api_key,
-            "CREEM_WEBHOOK_SECRET": self.webhook_secret,
+            f"{prefix}_PRODUCT_ID": self.product_id,
+            f"{prefix}_API_KEY": self.creem_api_key,
+            f"{prefix}_WEBHOOK_SECRET": self.webhook_secret,
             "RESEND_API_KEY": self.resend_api_key,
             "COMMERCE_EMAIL_FROM": self.email_from,
             "COMMERCE_SUPPORT_EMAIL": self.support_email,
@@ -116,4 +115,4 @@ class CommerceSettings:
                 "RECAPTCHA_SITE_KEY": self.recaptcha_site_key,
                 "RECAPTCHA_SECRET_KEY": self.recaptcha_secret_key,
             })
-        return [name for name, value in fields.items() if not value]
+        return [name for name, value in fields.items() if not value.strip()]

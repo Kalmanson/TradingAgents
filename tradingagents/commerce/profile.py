@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from copy import deepcopy
 from datetime import datetime
 from urllib.parse import urlsplit
@@ -10,7 +12,10 @@ from zoneinfo import ZoneInfo
 
 from tradingagents.application.runner import ANALYST_ORDER, AnalysisRequest
 from tradingagents.commerce.config import LANGUAGES
+from tradingagents.commerce.observability import log_event
 from tradingagents.dataflows.symbol_utils import normalize_symbol
+
+logger = logging.getLogger(__name__)
 
 
 def validate_inputs(ticker: str, language: str) -> str:
@@ -32,15 +37,30 @@ def validate_us_equity(ticker: str) -> None:
 
     from tradingagents.commerce.creem import ProviderUnavailable
 
+    started = time.monotonic()
+    context = {"provider": "yahoo_finance", "operation": "Ticker.get_info", "ticker": ticker}
+    log_event(logger, "market_data_request", **context)
     try:
         info = yf.Ticker(ticker).get_info() or {}
-    except Exception:
+    except Exception as exc:
+        # yfinance/curl 异常原文可能包含 Cookie、crumb 或代理凭据，只记录结构化错误信息。
+        response = getattr(exc, "response", None)
+        log_event(logger, "market_data_request_failed", level=logging.WARNING, **context,
+                  elapsed_ms=round((time.monotonic() - started) * 1000), error_type=type(exc).__name__,
+                  error_code=getattr(exc, "code", None), http_status=getattr(response, "status_code", None))
         raise ProviderUnavailable("Market data is temporarily unavailable.") from None
-    if not info:
+    elapsed_ms = round((time.monotonic() - started) * 1000)
+    if not isinstance(info, dict) or not info:
+        log_event(logger, "market_data_response", level=logging.WARNING, **context, elapsed_ms=elapsed_ms,
+                  result="unverifiable", body_format=type(info).__name__)
         raise ProviderUnavailable("We could not verify this stock. Please try again later.")
-    if info.get("quoteType") != "EQUITY" or info.get("exchange") not in {
+    eligible = info.get("quoteType") == "EQUITY" and info.get("exchange") in {
         "NMS", "NGM", "NCM", "NYQ", "ASE", "PCX", "BTS",
-    }:
+    }
+    log_event(logger, "market_data_response", level=logging.INFO if eligible else logging.WARNING,
+              **context, elapsed_ms=elapsed_ms, eligible=eligible,
+              response={field: info.get(field) for field in ("symbol", "quoteType", "exchange")})
+    if not eligible:
         raise ValueError("The first release supports stocks listed on US exchanges.")
 
 

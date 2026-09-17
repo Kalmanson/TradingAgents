@@ -68,6 +68,7 @@ class CommerceStore:
                     product_id TEXT NOT NULL,
                     amount INTEGER NOT NULL,
                     currency TEXT NOT NULL,
+                    tax_mode TEXT NOT NULL DEFAULT 'inclusive' CHECK(tax_mode IN ('inclusive','exclusive')),
                     mode TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'PENDING_PAYMENT'
                         CHECK(status IN ('PENDING_PAYMENT','PAID','RUNNING','COMPLETED','FAILED','REFUNDED')),
@@ -119,6 +120,11 @@ class CommerceStore:
                     UNIQUE(order_id, template_type)
                 );
             """)
+            # 旧版本全部为含税订单；迁移只补税费方式，保留原价格与支付记录。
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(trade_orders)")}
+            if "tax_mode" not in columns:
+                connection.execute("ALTER TABLE trade_orders ADD COLUMN tax_mode TEXT NOT NULL DEFAULT 'inclusive'")
+                connection.commit()
 
     def get_order(self, value: str, *, by: str = "id") -> dict | None:
         if by not in {"id", "status_token", "report_token", "trade_run_id", "idempotency_key"}:
@@ -127,7 +133,7 @@ class CommerceStore:
             row = connection.execute(f"SELECT * FROM trade_orders WHERE {by} = ?", (value,)).fetchone()
             return dict(row) if row else None
 
-    def create_order(self, ticker: str, language: str, profile: dict, key: str) -> tuple[dict, bool]:
+    def create_order(self, ticker: str, language: str, profile: dict, key: str, product: dict) -> tuple[dict, bool]:
         fingerprint = hashlib.sha256(json.dumps([ticker, language]).encode()).hexdigest()
         with self.tasks.transaction() as connection:
             row = connection.execute("SELECT * FROM trade_orders WHERE idempotency_key = ?", (key,)).fetchone()
@@ -139,10 +145,10 @@ class CommerceStore:
             connection.execute("""
                 INSERT INTO trade_orders
                     (id,idempotency_key,request_hash,ticker,language,params_json,product_id,amount,
-                     currency,mode,status_token,report_token,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     currency,tax_mode,mode,status_token,report_token,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (order_id, key, fingerprint, ticker, language, json.dumps(profile),
-                  self.settings.product_id, self.settings.amount, self.settings.currency,
+                  product["id"], product["price"], product["currency"], product["tax_mode"],
                   self.settings.creem_mode, secrets.token_urlsafe(32), secrets.token_urlsafe(32), utc_now()))
             return dict(connection.execute("SELECT * FROM trade_orders WHERE id = ?", (order_id,)).fetchone()), True
 

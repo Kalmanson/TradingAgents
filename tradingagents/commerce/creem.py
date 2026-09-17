@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import re
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -13,6 +17,7 @@ from urllib.parse import urlsplit
 import requests
 
 from tradingagents.commerce.config import CommerceSettings
+from tradingagents.commerce.observability import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +32,10 @@ class CheckoutUncertain(ProviderUnavailable):
 
 class PaymentRejected(ValueError):
     """A signed event failed the merchant's purchase contract."""
+
+
+class PriceChanged(ValueError):
+    """The visitor must review the current price before creating a checkout."""
 
 
 @dataclass(frozen=True)
@@ -61,9 +70,17 @@ class CreemClient:
             "https://api.creem.io" if settings.creem_mode == "prod"
             else "https://test-api.creem.io"
         )
+        self._product = None
+        self._product_expires_at = 0.0
+        self._product_lock = threading.Lock()
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
-        """统一限制超时；只记录 HTTP 状态及异常类型，不记录请求/响应内容。"""
+        """统一限制超时，并记录脱敏后的请求、响应和耗时。"""
+        started = time.monotonic()
+        context = {"provider": "creem", "exchange_id": uuid.uuid4().hex, "method": method,
+                   "path": path, "mode": self.settings.creem_mode}
+        log_event(logger, "creem_request", **context,
+                  request={"params": kwargs.get("params"), "json": kwargs.get("json")})
         try:
             response = self.transport.request(
                 method, self.base_url + path,
@@ -71,11 +88,21 @@ class CreemClient:
                 timeout=(3.05, 12), allow_redirects=False, **kwargs,
             )
         except requests.RequestException as exc:
-            logger.warning("Creem 请求失败 event=creem_request_failed method=%s error_type=%s",
-                           method, type(exc).__name__)
+            log_event(logger, "creem_request_failed", level=logging.WARNING, **context,
+                      elapsed_ms=round((time.monotonic() - started) * 1000), error_type=type(exc).__name__)
             # 创建操作可能已经被远端接受，异常类型提醒上层不要盲目重复 POST。
             error = CheckoutUncertain if method == "POST" else ProviderUnavailable
             raise error("Payment service temporarily unavailable.") from None
+        try:
+            data = response.json()
+            body_format = "json"
+        except ValueError:
+            data, body_format = None, "non_json"
+        headers = getattr(response, "headers", {})
+        log_event(logger, "creem_response", level=logging.INFO if 200 <= response.status_code < 300 else logging.WARNING,
+                  **context, http_status=response.status_code, elapsed_ms=round((time.monotonic() - started) * 1000),
+                  provider_request_id=headers.get("x-request-id"), content_type=headers.get("content-type"),
+                  body_format=body_format, response=data)
         if response.status_code >= 500 or response.status_code in {408, 429}:
             logger.warning("Creem 暂时不可用 event=creem_http_failed method=%s http_status=%s",
                            method, response.status_code)
@@ -85,18 +112,41 @@ class CreemClient:
             logger.warning("Creem 拒绝请求 event=creem_http_failed method=%s http_status=%s",
                            method, response.status_code)
             raise ProviderUnavailable(f"Payment service returned HTTP {response.status_code}.")
-        try:
-            data = response.json()
-            if not isinstance(data, dict):
-                raise ValueError
-            return data
-        except ValueError:
+        if not isinstance(data, dict):
             logger.warning("Creem 响应格式无效 event=creem_response_invalid method=%s", method)
             error = CheckoutUncertain if method == "POST" else ProviderUnavailable
             raise error("Payment service returned an invalid response.") from None
+        return data
 
-    def create_checkout(self, order: dict) -> dict:
-        product = self._request("GET", f"/v1/products/{order['product_id']}")
+    def get_product(self, *, refresh: bool = False) -> dict:
+        """首页短暂缓存公开商品信息；新下单总是重新从商户 API 读取。"""
+        with self._product_lock:
+            if not refresh and self._product and time.monotonic() < self._product_expires_at:
+                return dict(self._product)
+            try:
+                raw = self._request("GET", "/v1/products", params={"product_id": self.settings.product_id})
+                currency = raw.get("currency")
+                if (entity_id(raw) != self.settings.product_id
+                        or type(raw.get("price")) is not int or raw["price"] <= 0
+                        or not isinstance(currency, str) or not re.fullmatch(r"[A-Za-z]{3}", currency)
+                        or raw.get("billing_type") != "onetime"
+                        or raw.get("tax_mode") not in ("inclusive", "exclusive")
+                        or raw.get("mode", self.settings.creem_mode) != self.settings.creem_mode
+                        or raw.get("status", "active") != "active"):
+                    raise PaymentRejected("Configure an active one-time Creem product with a valid price and tax mode.")
+                product = {"id": raw["id"], "price": raw["price"], "currency": currency.upper(),
+                           "billing_type": "onetime", "tax_mode": raw["tax_mode"], "mode": self.settings.creem_mode}
+                # 仅用于发现页面展示后价格变化；价格本身始终来自服务端查询。
+                product["quote"] = hashlib.sha256(json.dumps(product, sort_keys=True).encode()).hexdigest()
+            except (ProviderUnavailable, PaymentRejected):
+                self._product = None
+                self._product_expires_at = 0.0
+                raise
+            self._product = product
+            self._product_expires_at = time.monotonic() + 60
+            return dict(product)
+
+    def create_checkout(self, order: dict, product: dict) -> dict:
         self._validate_product(product, order)
         result = self._request("POST", "/v1/checkouts", json={
             "product_id": order["product_id"],
@@ -105,13 +155,25 @@ class CreemClient:
             "success_url": f"{self.settings.public_url}/success/{order['status_token']}",
             "metadata": {"order_id": order["id"]},
         })
-        url = urlsplit(result.get("checkout_url", ""))
-        host = url.hostname or ""
-        if (not entity_id(result) or result.get("request_id") != order["id"]
-                or result.get("mode") != self.settings.creem_mode
-                or entity_id(result.get("product")) != order["product_id"]
-                or url.scheme != "https" or not (host == "creem.io" or host.endswith(".creem.io"))
-                or url.username or url.password):
+        try:
+            url = urlsplit(result.get("checkout_url", ""))
+            host = url.hostname or ""
+            valid_url = (url.scheme == "https" and (host == "creem.io" or host.endswith(".creem.io"))
+                         and not url.username and not url.password)
+        except (TypeError, ValueError, AttributeError):
+            valid_url = False
+        checks = {
+            "checkout_id_present": bool(entity_id(result)),
+            "request_id_matches": result.get("request_id") == order["id"],
+            "mode_matches": result.get("mode") == self.settings.creem_mode,
+            "product_id_matches": entity_id(result.get("product")) == order["product_id"],
+            "checkout_url_valid": bool(valid_url),
+        }
+        if not all(checks.values()):
+            log_event(logger, "checkout_validation_failed", level=logging.WARNING, order_id=order["id"],
+                      failed_checks=[name for name, passed in checks.items() if not passed],
+                      expected={"request_id": order["id"], "product_id": order["product_id"],
+                                "mode": self.settings.creem_mode}, response=result)
             raise CheckoutUncertain("Payment service returned an unexpected checkout.")
         return result
 
@@ -120,9 +182,9 @@ class CreemClient:
                 or type(product.get("price")) is not int or product["price"] != order["amount"]
                 or product.get("currency", "").upper() != order["currency"]
                 or product.get("billing_type") != "onetime"
-                or product.get("tax_mode") != "inclusive"
+                or product.get("tax_mode") != order["tax_mode"]
                 or product.get("mode", self.settings.creem_mode) != self.settings.creem_mode):
-            raise PaymentRejected("Product must match the configured one-time, tax-inclusive price.")
+            raise PaymentRejected("Product must match the order's saved price, currency and tax mode.")
 
     def validate_payment(self, checkout: dict, order: dict) -> Payment:
         """验证付款与本地订单的一致性，再提取可信的交付邮箱。"""
@@ -142,18 +204,28 @@ class CreemClient:
             checkout = fresh
         product = checkout.get("product")
         if isinstance(product, str):
-            product = self._request("GET", f"/v1/products/{product}")
+            product = self._request("GET", "/v1/products", params={"product_id": product})
         customer = checkout.get("customer")
         if isinstance(customer, str):
             customer = self._request("GET", "/v1/customers", params={"customer_id": customer})
         remote_order = checkout.get("order")
         if not all(isinstance(obj, dict) for obj in (product, customer, remote_order)):
             raise ProviderUnavailable("Incomplete payment information; retry the webhook.")
-        self._validate_product(product, order)
+        # 商品可能在订单创建后调价；按订单快照与实际付款核验，不读取当前售价作为标准。
+        if (entity_id(product) != order["product_id"]
+                or product.get("mode", self.settings.creem_mode) != self.settings.creem_mode):
+            raise PaymentRejected("Payment product does not match this order.")
         paid = remote_order.get("amount_paid", remote_order.get("amount"))
         due = remote_order.get("amount_due", remote_order.get("amount"))
-        # 当前商品为含税定价，应付和实付都必须等于 599 美分。
-        # sub_total 可能是税前小计，不应拿它与含税售价比较。
+        tax = remote_order.get("tax_amount", 0)
+        if type(tax) is not int or tax < 0 or order["tax_mode"] not in {"inclusive", "exclusive"}:
+            raise PaymentRejected("Invalid payment tax information.")
+        expected_total = order["amount"] + tax if order["tax_mode"] == "exclusive" else order["amount"]
+        expected_subtotal = expected_total - tax
+        if (expected_subtotal < 0
+                or ("sub_total" in remote_order and (type(remote_order["sub_total"]) is not int
+                                                     or remote_order["sub_total"] != expected_subtotal))):
+            raise PaymentRejected("Payment subtotal does not match the order's saved price.")
         if (checkout.get("status") != "completed"
                 or checkout.get("mode") != self.settings.creem_mode
                 or type(checkout.get("units", 1)) is not int or checkout.get("units", 1) != 1
@@ -162,8 +234,8 @@ class CreemClient:
                 or remote_order.get("mode", self.settings.creem_mode) != self.settings.creem_mode
                 or entity_id(remote_order.get("product")) != order["product_id"]
                 or remote_order.get("currency", "").upper() != order["currency"]
-                or type(paid) is not int or paid != order["amount"]
-                or type(due) is not int or due != order["amount"]
+                or type(paid) is not int or paid != expected_total
+                or type(due) is not int or due != expected_total
                 or remote_order.get("discount_amount", 0) not in (None, 0)
                 or checkout.get("subscription")):
             raise PaymentRejected("Payment does not match this purchase.")
@@ -190,12 +262,15 @@ class CreemClient:
         transaction_id = entity_id(transaction)
         if not transaction_id:
             raise PaymentRejected("Missing refund transaction.")
-        if not isinstance(transaction, dict) or not entity_id(transaction.get("order")):
+        if (not isinstance(transaction, dict) or not entity_id(transaction.get("order"))
+                or not transaction.get("currency")):
             transaction = self._request("GET", "/v1/transactions", params={"transaction_id": transaction_id})
         if (entity_id(transaction) != transaction_id or not entity_id(transaction.get("order"))
                 or transaction.get("mode", self.settings.creem_mode) != self.settings.creem_mode
                 or refund.get("status") != "succeeded"
-                or refund.get("refund_currency") != self.settings.currency):
+                or not isinstance(refund.get("refund_currency"), str)
+                or not re.fullmatch(r"[A-Z]{3}", refund["refund_currency"])
+                or transaction.get("currency") != refund["refund_currency"]):
             raise PaymentRejected("Unconfirmed or inconsistent refund.")
         return {
             "remote_order_id": entity_id(transaction["order"]),

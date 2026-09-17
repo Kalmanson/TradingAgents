@@ -173,7 +173,9 @@ You will see a screen where you can select your desired tickers, analysis date, 
 ### 按次付费股票报告网站
 
 可选的付费网站支持 Creem 收银台、11 种报告语言、订单关联的报告持久保存和邮件通知。
-安装 `pip install ".[mvp]"` 后运行 `tradingagents-mvp serve` 可在本地预览；默认关闭销售，域名、支付和邮件参数由服务器配置。
+价格、币种和税费方式从 Creem 商品读取，首页与订单使用相同来源；订单保存下单时的价格供支付核验。
+安装 `pip install ".[mvp]"` 并补齐 `.env` 后，运行 `tradingagents-mvp serve --mode test` 或 `--mode prod`。
+同一 `.env` 用 `CREEM_TEST_*`、`CREEM_PROD_*` 区分 Creem 凭据，其他配置共用；缺少必填项会直接拒绝启动并列出配置项。
 
 中文文档：[系统架构](docs/付费报告系统架构.md) · [部署与运行](docs/付费报告部署与运行.md) · [文档入口](docs/PAID_REPORT_MVP.md)。
 部署文档包含订单离线查询、报告导出、数据库备份恢复和常见故障处理的完整命令。

@@ -7,8 +7,10 @@ import logging
 import sqlite3
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, closing
+from decimal import Decimal
 from pathlib import Path
 
 import nh3
@@ -22,7 +24,13 @@ from starlette.concurrency import run_in_threadpool
 
 from tradingagents.commerce.captcha import CaptchaRejected, CaptchaUnavailable, verify_recaptcha
 from tradingagents.commerce.config import LANGUAGES, TOKEN_PATTERN, CommerceSettings
-from tradingagents.commerce.creem import PaymentRejected, ProviderUnavailable, verify_signature
+from tradingagents.commerce.creem import (
+    PaymentRejected,
+    PriceChanged,
+    ProviderUnavailable,
+    verify_signature,
+)
+from tradingagents.commerce.observability import log_event, trace_id
 from tradingagents.commerce.service import CommerceRuntime, CommerceService
 from tradingagents.commerce.store import CommerceStore
 
@@ -34,6 +42,7 @@ class PurchaseInput(BaseModel):
     ticker: str = Field(min_length=1, max_length=10)
     language: str = Field(default="en", min_length=2, max_length=8)
     recaptcha_token: str = Field(default="", max_length=4096, repr=False)
+    product_quote: str = Field(default="", max_length=64)
 
 
 class RateLimiter:
@@ -119,14 +128,46 @@ def create_app(settings: CommerceSettings | None = None, *, service: CommerceSer
             response.headers["Strict-Transport-Security"] = "max-age=31536000"
         return response
 
+    @app.middleware("http")
+    async def trace_interactions(request: Request, call_next):
+        # Generate locally; do not trust/log a caller-supplied tracing header.
+        token = trace_id.set(uuid.uuid4().hex)
+        started = time.monotonic()
+        tracked = request.url.path in {"/api/orders", "/api/webhooks/creem"}
+        context = {"method": request.method, "path": request.url.path}
+        try:
+            if tracked:
+                log_event(logger, "http_request", **context)
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = trace_id.get()
+            if tracked:
+                log_event(logger, "http_response", **context,
+                          level=logging.INFO if response.status_code < 400 else logging.WARNING,
+                          http_status=response.status_code, elapsed_ms=round((time.monotonic() - started) * 1000))
+            return response
+        except Exception as exc:
+            if tracked:
+                log_event(logger, "http_request_failed", level=logging.ERROR, **context,
+                          elapsed_ms=round((time.monotonic() - started) * 1000), error_type=type(exc).__name__)
+            raise
+        finally:
+            trace_id.reset(token)
+
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request):
-        available = (settings.sales_enabled and not settings.missing_configuration()
-                     and service.store.capacity_available() and (not start_workers or runtime.healthy()))
+        available = service.store.capacity_available() and (not start_workers or runtime.healthy())
+        product = None
+        try:
+            product = service.creem.get_product()
+            product["display_price"] = f"{Decimal(product['price']) / 100:,.2f}"
+        except (ProviderUnavailable, PaymentRejected) as exc:
+            logger.warning("商品价格暂不可用 event=product_unavailable error_type=%s", type(exc).__name__)
+            available = False
         return templates.TemplateResponse(request=request, name="index.html", context={
             "languages": LANGUAGES, "available": available, "support_email": settings.support_email,
+            "product": product,
             "recaptcha_site_key": settings.recaptcha_site_key if settings.recaptcha_enabled else "",
-        })
+        }, status_code=200 if product else 503)
 
     @app.post("/api/orders")
     async def purchase(request: Request, idempotency_key: str = Header(default="")):
@@ -139,10 +180,9 @@ def create_app(settings: CommerceSettings | None = None, *, service: CommerceSer
             inputs = PurchaseInput.model_validate_json(chunks)
         except ValueError:
             raise HTTPException(422, "Provide a valid ticker, report language and verification token.") from None
+        log_event(logger, "purchase_request", request=inputs.model_dump())
         if start_workers and not runtime.healthy():
             raise HTTPException(503, "Report generation is temporarily unavailable.")
-        if not settings.sales_enabled or settings.missing_configuration():
-            raise HTTPException(503, "Report purchases are not available yet.")
         if settings.recaptcha_enabled:
             try:
                 await run_in_threadpool(verify_recaptcha, inputs.recaptcha_token, settings)
@@ -151,14 +191,19 @@ def create_app(settings: CommerceSettings | None = None, *, service: CommerceSer
             except CaptchaUnavailable as exc:
                 raise HTTPException(503, str(exc)) from None
         try:
-            order = await run_in_threadpool(service.create_checkout, inputs.ticker, inputs.language, idempotency_key)
+            order = await run_in_threadpool(service.create_checkout, inputs.ticker, inputs.language,
+                                           idempotency_key, inputs.product_quote)
+        except PriceChanged as exc:
+            raise HTTPException(409, str(exc)) from None
         except PaymentRejected:
             raise HTTPException(503, "Checkout is not configured correctly. Please contact support.") from None
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
         except ProviderUnavailable as exc:
             raise HTTPException(503, str(exc)) from None
-        return {"checkoutUrl": order["checkout_url"], "statusUrl": f"/success/{order['status_token']}"}
+        response = {"checkoutUrl": order["checkout_url"], "statusUrl": f"/success/{order['status_token']}"}
+        log_event(logger, "purchase_response", order_id=order["id"], response=response)
+        return response
 
     @app.post("/api/webhooks/creem")
     async def webhook(request: Request):
@@ -185,7 +230,9 @@ def create_app(settings: CommerceSettings | None = None, *, service: CommerceSer
         except (ProviderUnavailable, sqlite3.OperationalError) as exc:
             logger.warning("支付确认暂未完成 event=webhook_unavailable error_type=%s", type(exc).__name__)
             raise HTTPException(503, "Payment confirmation is pending. Please retry.") from None
-        return {"received": True, "result": result}
+        response = {"received": True, "result": result}
+        log_event(logger, "webhook_response", response=response)
+        return response
 
     def public_status(order: dict) -> dict:
         return {"status": order["status"], "ticker": order["ticker"], "language": order["language"],
@@ -251,8 +298,8 @@ def create_app(settings: CommerceSettings | None = None, *, service: CommerceSer
             available = service.store.capacity_available()
         except sqlite3.Error:
             healthy = False
-        return JSONResponse({"ready": healthy, "acceptingOrders": healthy and settings.sales_enabled
-                             and available and not settings.missing_configuration()}, status_code=200 if healthy else 503)
+        return JSONResponse({"ready": healthy, "acceptingOrders": healthy and available},
+                            status_code=200 if healthy else 503)
 
     @app.get("/terms", response_class=HTMLResponse)
     @app.get("/privacy", response_class=HTMLResponse)

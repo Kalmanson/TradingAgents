@@ -18,9 +18,11 @@ from tradingagents.commerce.creem import (
     CheckoutUncertain,
     CreemClient,
     PaymentRejected,
+    PriceChanged,
     ProviderUnavailable,
 )
 from tradingagents.commerce.email import EmailClient
+from tradingagents.commerce.observability import log_event, trace_id
 from tradingagents.commerce.profile import build_profile, validate_inputs, validate_us_equity
 from tradingagents.commerce.store import CommerceStore
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -38,15 +40,12 @@ class CommerceService:
         self.stock_validator = stock_validator
         self.base_config = deepcopy(DEFAULT_CONFIG if base_config is None else base_config)
 
-    def create_checkout(self, ticker: str, language: str, idempotency_key: str) -> dict:
+    def create_checkout(self, ticker: str, language: str, idempotency_key: str, product_quote: str = "") -> dict:
         """先保存订单再创建收银台；相同请求重试时复用原订单。"""
         started = time.monotonic()
         if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", idempotency_key):
             raise ValueError("A valid Idempotency-Key header is required.")
         ticker = validate_inputs(ticker, language)
-        if not self.settings.sales_enabled or self.settings.missing_configuration():
-            logger.debug("购买入口未开放 event=checkout_unavailable reason=configuration_or_sales_disabled")
-            raise ProviderUnavailable("Report purchases are not available yet.")
         existing = self.store.get_order(idempotency_key, by="idempotency_key")
         if existing:
             if existing["ticker"] != ticker or existing["language"] != language:
@@ -54,28 +53,32 @@ class CommerceService:
             if existing["checkout_url"]:
                 logger.info("复用已有收银台 event=checkout_reused order_id=%s", existing["id"])
                 return existing
-            logger.warning("收银台结果待核对 event=checkout_unconfirmed order_id=%s checkout_status=%s",
-                           existing["id"], existing["checkout_status"])
+            logger.warning("收银台结果待核对 event=checkout_unconfirmed order_id=%s checkout_status=%s trace_id=%s",
+                           existing["id"], existing["checkout_status"], trace_id.get())
             raise ProviderUnavailable("This checkout could not be confirmed. Please contact support before trying again.")
         if not self.store.capacity_available():
             logger.info("暂缓新购买 event=checkout_unavailable reason=capacity_or_stalled_run")
             raise ProviderUnavailable("We are at capacity. Please return shortly.")
+        product = self.creem.get_product(refresh=True)
+        if product_quote and product_quote != product["quote"]:
+            raise PriceChanged("Product pricing changed. Reload this page and review the new price before continuing.")
         self.stock_validator(ticker)
         profile = build_profile(ticker, language, self.base_config)
-        order, created = self.store.create_order(ticker, language, profile, idempotency_key)
+        order, created = self.store.create_order(ticker, language, profile, idempotency_key, product)
         if not created:
             # 并发请求可能同时通过首次查询，数据库唯一约束决定谁负责创建收银台。
             if order["checkout_url"]:
                 return order
             raise ProviderUnavailable("Checkout is being prepared. Please wait before retrying.")
-        logger.info("订单已创建 event=order_created order_id=%s ticker=%s language=%s",
-                    order["id"], ticker, language)
+        logger.info("订单已创建 event=order_created order_id=%s ticker=%s language=%s trace_id=%s",
+                    order["id"], ticker, language, trace_id.get())
         try:
-            checkout = self.creem.create_checkout(order)
-        except CheckoutUncertain:
+            checkout = self.creem.create_checkout(order, product)
+        except CheckoutUncertain as exc:
             # POST 超时不代表远端失败，标记 UNKNOWN 后交由人工核对，不能盲目重发。
             self.store.checkout_failed(order["id"], uncertain=True)
-            logger.warning("收银台创建结果不确定 event=checkout_uncertain order_id=%s", order["id"])
+            logger.warning("收银台创建结果不确定 event=checkout_uncertain order_id=%s trace_id=%s reason=%s",
+                           order["id"], trace_id.get(), str(exc))
             raise
         except (ProviderUnavailable, PaymentRejected) as exc:
             self.store.checkout_failed(order["id"], uncertain=False)
@@ -84,8 +87,8 @@ class CommerceService:
             raise
         self.store.save_checkout(order["id"], checkout)
         # 不输出 checkout_url，它可能携带会话凭证；订单号足以关联后续处理。
-        logger.info("收银台已就绪 event=checkout_ready order_id=%s elapsed_ms=%.0f",
-                    order["id"], (time.monotonic() - started) * 1000)
+        logger.info("收银台已就绪 event=checkout_ready order_id=%s elapsed_ms=%.0f trace_id=%s",
+                    order["id"], (time.monotonic() - started) * 1000, trace_id.get())
         return self.store.get_order(order["id"])
 
     def process_webhook(self, event: dict, raw: bytes) -> str:
@@ -96,6 +99,7 @@ class CommerceService:
                 or not isinstance(event.get("eventType"), str) or len(event["eventType"]) > 80
                 or not isinstance(event.get("object"), dict)):
             raise ValueError("Malformed webhook event")
+        log_event(logger, "webhook_request", event_id=event["id"], request=event)
         payload_hash = hashlib.sha256(raw).hexdigest()
         previous = self.store.event_result(event["id"], payload_hash)
         if previous:
@@ -210,9 +214,7 @@ class CommerceRuntime:
             self.service.store.reconcile()
             self.thread = threading.Thread(target=self._loop, name="report-delivery", daemon=True)
             self.thread.start()
-            logger.info("付费报告服务已启动 event=runtime_started mode=%s sales_enabled=%s missing_configuration=%s",
-                        self.service.settings.creem_mode, self.service.settings.sales_enabled,
-                        ",".join(self.service.settings.missing_configuration()) or "none")
+            logger.info("付费报告服务已启动 event=runtime_started mode=%s", self.service.settings.creem_mode)
         except BaseException:
             self.stop()
             raise

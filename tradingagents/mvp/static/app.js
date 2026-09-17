@@ -49,8 +49,11 @@ if (form) {
       error.hidden = false;
       return;
     }
-    const body = { ticker: ticker.value.trim().toUpperCase(), language: language.value };
-    // Only purchase inputs identify a retry; the one-use CAPTCHA token must not
+    const body = {
+      ticker: ticker.value.trim().toUpperCase(), language: language.value,
+      product_quote: form.dataset.productQuote,
+    };
+    // Purchase inputs and the displayed price identify a retry; the CAPTCHA token must not
     // be persisted or cause a new idempotency key when verification is repeated.
     const fingerprint = JSON.stringify(body);
     let saved;

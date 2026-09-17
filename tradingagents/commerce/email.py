@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import html
 import logging
+import time
+import uuid
 
 import requests
 
 from tradingagents.commerce.config import LANGUAGES, CommerceSettings
 from tradingagents.commerce.creem import ProviderUnavailable
+from tradingagents.commerce.observability import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,10 @@ class EmailClient:
         """用固定的交付 ID 作为幂等键，网络失败由上层按同一内容重试。"""
         if not self.settings.resend_api_key:
             raise ProviderUnavailable("Resend is not configured.")
+        started = time.monotonic()
+        context = {"provider": "resend", "exchange_id": uuid.uuid4().hex, "method": "POST", "path": "/emails",
+                   "delivery_id": delivery["id"], "order_id": delivery.get("order_id")}
+        log_event(logger, "resend_request", **context, request=payload)
         try:
             response = self.transport.request(
                 "POST", "https://api.resend.com/emails",
@@ -49,16 +56,26 @@ class EmailClient:
                          "Idempotency-Key": f"report/{delivery['id']}"},
                 json=payload, timeout=(3.05, 12), allow_redirects=False,
             )
+            try:
+                result = response.json()
+                body_format = "json"
+            except ValueError:
+                result, body_format = None, "non_json"
+            headers = getattr(response, "headers", {})
+            log_event(logger, "resend_response", **context,
+                      level=logging.INFO if 200 <= response.status_code < 300 else logging.WARNING,
+                      http_status=response.status_code, elapsed_ms=round((time.monotonic() - started) * 1000),
+                      provider_request_id=headers.get("x-request-id"), body_format=body_format, response=result)
             if not 200 <= response.status_code < 300:
                 logger.warning("Resend 拒绝邮件请求 event=resend_http_failed delivery_id=%s http_status=%s",
                                delivery["id"], response.status_code)
                 raise ProviderUnavailable(f"Email service returned HTTP {response.status_code}.")
-            message_id = response.json().get("id")
+            message_id = result.get("id") if isinstance(result, dict) else None
             if not isinstance(message_id, str) or not message_id:
                 raise ValueError
             return message_id
         except (requests.RequestException, ValueError) as exc:
             # 原异常可能带有请求内容；日志只保留已知交付 ID 和异常类型。
-            logger.warning("Resend 响应未确认 event=resend_response_unconfirmed delivery_id=%s error_type=%s",
-                           delivery["id"], type(exc).__name__)
+            log_event(logger, "resend_response_unconfirmed", level=logging.WARNING, **context,
+                      elapsed_ms=round((time.monotonic() - started) * 1000), error_type=type(exc).__name__)
             raise ProviderUnavailable("Email response unavailable; retry with the same idempotency key.") from None

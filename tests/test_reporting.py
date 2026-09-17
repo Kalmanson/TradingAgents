@@ -289,7 +289,7 @@ def commerce(tmp_path):
         data_dir=tmp_path / "commerce", public_url="http://testserver", product_id="prod_report",
         creem_api_key="merchant-test-key", webhook_secret="webhook-test-secret",
         resend_api_key="resend-test-key", email_from="reports@example.com",
-        support_email="support@example.com", sales_enabled=True, recaptcha_enabled=False,
+        support_email="support@example.com", recaptcha_enabled=False,
     )
 
     class Transport:
@@ -301,12 +301,17 @@ def commerce(tmp_path):
             self.email_timeout = False
             self.email_fail = False
             self.lookup_checkout = None
+            self.product = {"id": "prod_report", "price": 599, "currency": "USD", "billing_type": "onetime",
+                            "tax_mode": "inclusive", "mode": "test", "status": "active"}
+            self.product_unavailable = False
 
         def request(self, method, url, **kwargs):
             self.requests.append((method, url, deepcopy(kwargs)))
-            if url.endswith("/v1/products/prod_report"):
-                body = {"id": "prod_report", "price": 599, "currency": "USD", "billing_type": "onetime",
-                        "tax_mode": "inclusive", "mode": "test"}
+            if url.endswith("/v1/products") and method == "GET":
+                assert kwargs["params"] == {"product_id": "prod_report"}
+                if self.product_unavailable:
+                    return SimpleNamespace(status_code=503, json=lambda: {})
+                body = deepcopy(self.product)
             elif url.endswith("/v1/checkouts") and method == "POST":
                 self.checkouts.append(kwargs["json"])
                 if self.ambiguous_checkout:
@@ -343,13 +348,16 @@ def commerce(tmp_path):
         return store.get_order(key, by="idempotency_key")
 
     def event(order):
+        tax = 100
+        total = order["amount"] + tax if order["tax_mode"] == "exclusive" else order["amount"]
         return {"id": "evt_" + uuid.uuid4().hex, "eventType": "checkout.completed", "object": {
             "id": order["creem_checkout_id"], "request_id": order["id"], "status": "completed", "mode": "test", "units": 1,
-            "product": {"id": "prod_report", "price": 599, "currency": "USD", "billing_type": "onetime", "tax_mode": "inclusive"},
+            "product": {"id": order["product_id"], "price": order["amount"], "currency": order["currency"],
+                        "billing_type": "onetime", "tax_mode": order["tax_mode"]},
             "order": {"id": "ord_" + order["id"], "transaction": "tran_" + order["id"],
-                      "customer": "cust_payer", "product": "prod_report", "amount": 599,
-                      "amount_paid": 599, "amount_due": 599, "sub_total": 499, "tax_amount": 100,
-                      "currency": "USD", "status": "paid", "type": "onetime",
+                      "customer": "cust_payer", "product": order["product_id"], "amount": order["amount"],
+                      "amount_paid": total, "amount_due": total, "sub_total": total - tax, "tax_amount": tax,
+                      "currency": order["currency"], "status": "paid", "type": "onetime",
                       "created_at": datetime.now(timezone.utc).isoformat()},
             "customer": {"id": "cust_payer", "email": "payer@example.com"},
         }}
@@ -409,7 +417,7 @@ def test_commerce_readiness_pauses_sales_at_capacity(commerce):
         order = c.purchase()
         assert c.post_event(c.event(order)).status_code == 200
     assert c.client.get("/health/ready").json() == {"ready": True, "acceptingOrders": False}
-    assert "Report purchases opening soon" in c.client.get("/").text
+    assert "Reports temporarily unavailable" in c.client.get("/").text
     assert c.client.post("/api/orders", json={"ticker": "RXRX", "language": "en"},
                          headers={"Idempotency-Key": "capacity-request-key-12345"}).status_code == 503
 
@@ -520,7 +528,7 @@ def test_bad_signature_and_duplicate_payment_are_harmless(commerce):
     ("order", "amount_paid", 1), ("order", "amount_due", 600),
     ("order", "currency", "EUR"), ("order", "status", "pending"),
     ("order", "customer", "cust_attacker"), ("product", "id", "prod_other"),
-    ("product", "tax_mode", "exclusive"), ("checkout", "units", 2),
+    ("order", "sub_total", 1), ("order", "tax_amount", -1), ("checkout", "units", 2),
     ("checkout", "mode", "prod"), ("checkout", "status", "pending"),
 ])
 def test_inconsistent_signed_payment_never_runs(commerce, part, field, value):
@@ -655,7 +663,8 @@ def test_full_refund_never_reopens_access_but_preserves_report(commerce, before_
     event = commerce.event(order)
     refund = {"id": "evt_" + uuid.uuid4().hex, "eventType": "refund.created", "object": {
         "status": "succeeded", "refund_currency": "USD", "refund_amount": 599,
-        "transaction": {"id": "tran_" + order["id"], "order": "ord_" + order["id"], "status": "refunded", "mode": "test"},
+        "transaction": {"id": "tran_" + order["id"], "order": "ord_" + order["id"],
+                        "status": "refunded", "mode": "test", "currency": "USD"},
     }}
     if not before_payment:
         commerce.post_event(event)
@@ -731,8 +740,12 @@ def test_real_worker_lifecycle_delivers_after_browser_closes(commerce):
 def test_commerce_logs_correlate_delivery_without_sensitive_data(commerce, caplog):
     import json
     import logging
+    import re
+
+    from tradingagents.commerce.observability import trace_id
 
     caplog.set_level(logging.DEBUG, logger="tradingagents.commerce")
+    caplog.set_level(logging.INFO, logger="tradingagents.mvp")
     c = commerce
     order = c.purchase()
     event = c.event(order)
@@ -758,6 +771,245 @@ def test_commerce_logs_correlate_delivery_without_sensitive_data(commerce, caplo
     for sensitive in (order["status_token"], order["report_token"], order["idempotency_key"],
                       order["checkout_url"], "payer@example.com", complete["report_markdown"],
                       c.settings.webhook_secret, c.settings.creem_api_key, c.settings.resend_api_key):
+        assert sensitive not in output
+    for name in ("creem_request", "creem_response", "webhook_request", "resend_request", "resend_response"):
+        assert f"event={name} " in output
+    assert '"http_status":200' in output and '"elapsed_ms":' in output
+    assert '"price":599' in output and '"tax_mode":"inclusive"' in output
+    assert '"email":"[redacted]"' in output and '"html":"[redacted]"' in output
+    browser_records = [r.getMessage() for r in caplog.records if r.name.startswith("tradingagents.mvp")]
+    for name in ("http_request", "purchase_request", "purchase_response", "webhook_response", "http_response"):
+        assert any(f"event={name} " in record for record in browser_records)
+    # The server creates a fresh correlation ID; neither caller headers nor worker context leak to another request.
+    request_trace = re.search(r"event=purchase_request trace_id=([a-f0-9]{32})", "\n".join(browser_records)).group(1)
+    assert any(f"event=creem_request trace_id={request_trace}" in record for record in records)
+    assert any(f"event=http_response trace_id={request_trace}" in record for record in browser_records)
+    assert trace_id.get() == "-"
+    caplog.clear()
+    c.client.get(f"/api/orders/status/{order['status_token']}")
+    assert not [r for r in caplog.records if r.name.startswith(("tradingagents.commerce", "tradingagents.mvp"))]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("field,value,failed_check", [
+    ("id", None, "checkout_id_present"),
+    ("request_id", "wrong_order", "request_id_matches"),
+    ("mode", "prod", "mode_matches"),
+    ("mode", None, "mode_matches"),
+    ("product", "prod_other", "product_id_matches"),
+    ("checkout_url", "https://other.example/private-checkout?token=secret", "checkout_url_valid"),
+    ("checkout_url", ["malformed-private-url"], "checkout_url_valid"),
+])
+def test_checkout_validation_logs_exact_failure_and_keeps_unknown_order(commerce, caplog, monkeypatch,
+                                                                         field, value, failed_check):
+    import json
+    import logging
+
+    caplog.set_level(logging.INFO, logger="tradingagents.commerce")
+    caplog.set_level(logging.INFO, logger="tradingagents.mvp")
+    c = commerce
+    original = c.transport.request
+
+    def altered_response(method, url, **kwargs):
+        response = original(method, url, **kwargs)
+        if method == "POST" and url.endswith("/v1/checkouts"):
+            body = {**response.json(), field: value}
+            return SimpleNamespace(status_code=200, json=lambda: body)
+        return response
+
+    monkeypatch.setattr(c.transport, "request", altered_response)
+    headers = {"Idempotency-Key": "logging-uncertain-request-12345", "X-Request-ID": "untrusted-trace-value"}
+    response = c.client.post("/api/orders", json={"ticker": "INTC", "language": "zh-CN"}, headers=headers)
+    assert response.status_code == 503
+    record = next(r.getMessage() for r in caplog.records if "event=checkout_validation_failed " in r.getMessage())
+    trace = response.headers["X-Request-ID"]
+    assert f"trace_id={trace}" in record
+    details = json.loads(record.split(" data=", 1)[1])
+    assert details["failed_checks"] == [failed_check]
+    assert details["expected"]["mode"] == "test"
+    if field == "mode":
+        assert details["response"]["mode"] == value
+    order = c.store.get_order(details["order_id"])
+    assert order["checkout_status"] == "UNKNOWN"
+    repeat = c.client.post("/api/orders", json={"ticker": "INTC", "language": "zh-CN"}, headers=headers)
+    assert repeat.status_code == 503 and len(c.transport.checkouts) == 1
+    assert repeat.headers["X-Request-ID"] != trace
+    output = "\n".join(r.getMessage() for r in caplog.records)
+    assert "reason=Payment service returned an unexpected checkout." in output
+    for private in ("untrusted-trace-value", "private-checkout", "malformed-private-url",
+                    headers["Idempotency-Key"], order["status_token"], c.settings.creem_api_key):
+        assert private not in output
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("kind", ["timeout", "http_400", "http_503", "non_json", "json_list"])
+def test_creem_failure_logs_request_response_and_timing_without_raw_text(commerce, caplog, monkeypatch, kind):
+    import logging
+
+    import requests
+
+    from tradingagents.commerce.creem import ProviderUnavailable
+
+    caplog.set_level(logging.INFO, logger="tradingagents.commerce")
+    c = commerce
+    private = "private-upstream-message buyer@example.com secret-payload"
+    status = 400 if kind == "http_400" else 503 if kind == "http_503" else 200
+
+    def request(*args, **kwargs):
+        if kind == "timeout":
+            raise requests.ReadTimeout(private)
+
+        def body():
+            if kind == "non_json":
+                raise ValueError(private)
+            if kind == "json_list":
+                return [private]
+            return {"code": "invalid_product", "message": private, "secret": c.settings.creem_api_key}
+
+        return SimpleNamespace(status_code=status, json=body,
+                               headers={"x-request-id": "creem-request-123", "content-type": "application/json"})
+
+    monkeypatch.setattr(c.transport, "request", request)
+    with pytest.raises(ProviderUnavailable):
+        c.service.creem._request("POST", "/v1/checkouts", json={"product_id": "prod_report",
+                                "success_url": "https://merchant.example/success/private-access-token"})
+    records = [r.getMessage() for r in caplog.records]
+    output = "\n".join(records)
+    assert "event=creem_request " in output and '"elapsed_ms":' in output
+    if kind == "timeout":
+        assert "event=creem_request_failed " in output and '"error_type":"ReadTimeout"' in output
+    else:
+        assert "event=creem_response " in output and f'"http_status":{status}' in output
+        assert '"provider_request_id":"creem-request-123"' in output
+    if kind.startswith("http_"):
+        assert '"code":"invalid_product"' in output
+    if kind == "non_json":
+        assert '"body_format":"non_json"' in output
+    for sensitive in (private, "buyer@example.com", "secret-payload", "private-access-token", c.settings.creem_api_key):
+        assert sensitive not in output
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("kind", ["success", "wrong_host", "rejected", "timeout", "http_500", "non_json"])
+def test_recaptcha_logs_protocol_fields_without_token_or_secret(commerce, caplog, monkeypatch, kind):
+    import logging
+    from dataclasses import replace
+
+    import requests
+
+    from tradingagents.commerce.captcha import CaptchaRejected, CaptchaUnavailable, verify_recaptcha
+
+    caplog.set_level(logging.INFO, logger="tradingagents.commerce")
+    settings = replace(commerce.settings, recaptcha_enabled=True, recaptcha_site_key="public-site-key",
+                       recaptcha_secret_key="private-captcha-secret")
+
+    def post(*args, **kwargs):
+        if kind == "timeout":
+            raise requests.ReadTimeout("private-captcha-token private-captcha-secret")
+
+        def body():
+            if kind == "non_json":
+                raise ValueError("private-captcha-token")
+            return {"success": kind != "rejected", "hostname": "other.example" if kind == "wrong_host" else "testserver",
+                    "error-codes": ["timeout-or-duplicate"] if kind == "rejected" else [],
+                    "unexpected": "private-captcha-token"}
+
+        return SimpleNamespace(status_code=500 if kind == "http_500" else 200, json=body)
+
+    monkeypatch.setattr("tradingagents.commerce.captcha.requests.post", post)
+    if kind == "success":
+        verify_recaptcha("private-captcha-token", settings)
+    else:
+        with pytest.raises((CaptchaRejected, CaptchaUnavailable)):
+            verify_recaptcha("private-captcha-token", settings)
+    output = "\n".join(r.getMessage() for r in caplog.records)
+    assert "event=recaptcha_request " in output and '"elapsed_ms":' in output
+    if kind != "timeout":
+        assert "event=recaptcha_response " in output and '"expected_hostname":"testserver"' in output
+    if kind == "wrong_host":
+        assert '"hostname":"other.example"' in output
+    if kind == "rejected":
+        assert "timeout-or-duplicate" in output
+    assert "private-captcha-token" not in output and "private-captcha-secret" not in output
+
+
+def test_interaction_log_redaction_is_bounded_and_single_line(caplog):
+    import json
+    import logging
+
+    from tradingagents.commerce.observability import log_event
+
+    logger = logging.getLogger("tradingagents.commerce.observability")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    log_event(logger, "redaction_test", response={
+        "id": "unexpected\nevent=forged", "message": "private-free-text", "Authorization": "Bearer private-key",
+        "customer": {"id": "cust_123", "email": "payer@example.com", "name": "Private Person"},
+        "checkout_url": "https://user:password@checkout.creem.io/private-session?signature=private-signature",
+        "items": [{"secret": "private-nested-key", "price": 1900}] * 100,
+    })
+    message = caplog.records[-1].getMessage()
+    assert "\n" not in message and '"id":"cust_123"' in message and '"price":1900' in message
+    for secret in ("event=forged", "private-free-text", "private-key", "payer@example.com", "Private Person",
+                   "password", "private-session", "private-signature", "private-nested-key"):
+        assert secret not in message
+    log_event(logger, "redaction_test", response={f"field_{i}": {f"field_{j}": "private" for j in range(50)}
+                                                 for i in range(50)})
+    message = caplog.records[-1].getMessage()
+    assert len(message) < 8200 and json.loads(message.split(" data=", 1)[1])["truncated"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("kind,expected_status", [
+    ("equity", 200), ("etf", 422), ("foreign_exchange", 422), ("empty", 503),
+    ("timeout", 503), ("rate_limit", 503), ("invalid_response", 503),
+])
+def test_market_data_logs_eligibility_and_errors_before_order_creation(commerce, caplog, monkeypatch,
+                                                                       kind, expected_status):
+    import logging
+
+    from curl_cffi.requests.exceptions import HTTPError, Timeout
+
+    from tradingagents.commerce.profile import validate_us_equity
+
+    caplog.set_level(logging.INFO, logger="tradingagents.commerce")
+    c = commerce
+
+    def get_info():
+        if kind == "timeout":
+            raise Timeout("private-yahoo-crumb private-proxy-password", code=28)
+        if kind == "rate_limit":
+            raise HTTPError("private-yahoo-cookie", response=SimpleNamespace(status_code=429))
+        if kind == "invalid_response":
+            return ["private-response"]
+        if kind == "empty":
+            return {}
+        return {"symbol": "SPCX", "quoteType": "ETF" if kind == "etf" else "EQUITY",
+                "exchange": "LSE" if kind == "foreign_exchange" else "NMS",
+                "unexpected": "private-company-profile"}
+
+    monkeypatch.setattr("yfinance.Ticker", lambda ticker: SimpleNamespace(get_info=get_info))
+    c.service.stock_validator = validate_us_equity
+    response = c.client.post("/api/orders", json={"ticker": "SPCX", "language": "zh-CN"},
+                             headers={"Idempotency-Key": "market-data-query-test-12345"})
+    assert response.status_code == expected_status
+    records = [r.getMessage() for r in caplog.records]
+    output = "\n".join(records)
+    trace = response.headers["X-Request-ID"]
+    assert f"event=market_data_request trace_id={trace}" in output and '"ticker":"SPCX"' in output
+    assert '"operation":"Ticker.get_info"' in output and '"elapsed_ms":' in output
+    if kind in {"timeout", "rate_limit"}:
+        assert f"event=market_data_request_failed trace_id={trace}" in output
+        assert '"error_code":28' in output if kind == "timeout" else '"http_status":429' in output
+        assert response.json()["detail"] == "Market data is temporarily unavailable."
+    else:
+        assert f"event=market_data_response trace_id={trace}" in output
+    if kind == "equity":
+        assert '"eligible":true' in output and '"quoteType":"EQUITY"' in output and '"exchange":"NMS"' in output
+    else:
+        assert not c.transport.checkouts
+        assert c.store.get_order("market-data-query-test-12345", by="idempotency_key") is None
+    for sensitive in ("private-yahoo-crumb", "private-proxy-password", "private-yahoo-cookie",
+                      "private-response", "private-company-profile"):
         assert sensitive not in output
 
 
@@ -822,9 +1074,14 @@ def test_commerce_cli_configures_visible_logs_without_duplicate_handlers():
     code = '''
 import logging
 import logging.config
+import dotenv
 import uvicorn
 from uvicorn.config import LOGGING_CONFIG
+from tradingagents.commerce.config import CommerceSettings
 from tradingagents.mvp.cli import main
+
+dotenv.load_dotenv = lambda **kwargs: None
+CommerceSettings.from_env = lambda: None
 
 def check_run(*args, **kwargs):
     assert kwargs["access_log"] is False
@@ -973,23 +1230,27 @@ def test_captcha_page_and_csp_are_scoped_to_purchase(protected_storefront):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("missing", ["recaptcha_site_key", "recaptcha_secret_key"])
-def test_missing_captcha_configuration_closes_sales(protected_storefront, missing):
+@pytest.mark.parametrize("missing,variable", [
+    ("product_id", "CREEM_TEST_PRODUCT_ID"),
+    ("creem_api_key", "CREEM_TEST_API_KEY"),
+    ("webhook_secret", "CREEM_TEST_WEBHOOK_SECRET"),
+    ("resend_api_key", "RESEND_API_KEY"),
+    ("email_from", "COMMERCE_EMAIL_FROM"),
+    ("support_email", "COMMERCE_SUPPORT_EMAIL"),
+    ("recaptcha_site_key", "RECAPTCHA_SITE_KEY"),
+    ("recaptcha_secret_key", "RECAPTCHA_SECRET_KEY"),
+])
+@pytest.mark.parametrize("value", ["", " "])
+def test_missing_captcha_configuration_closes_sales(protected_storefront, missing, variable, value):
     from dataclasses import replace
-
-    from fastapi.testclient import TestClient
 
     from tradingagents.mvp.app import create_app
 
     c = protected_storefront
-    settings = replace(c.settings, **{missing: ""})
-    with TestClient(create_app(settings, service=c.commerce.service, start_workers=False)) as client:
-        home = client.get("/")
-        assert "Report purchases opening soon" in home.text
-        assert 'id="purchase-captcha"' not in home.text
-        assert not client.get("/health/ready").json()["acceptingOrders"]
-        response = client.post("/api/orders", json={"ticker": "AAPL", "recaptcha_token": "token"})
-        assert response.status_code == 503
+    settings = replace(c.settings, data_dir=c.settings.data_dir / "invalid-start", **{missing: value})
+    with pytest.raises(ValueError, match=variable):
+        create_app(settings)
+    assert not settings.data_dir.exists()
     c.verification.assert_not_called()
     assert not c.commerce.transport.requests
 
@@ -1041,6 +1302,17 @@ def test_security_configuration_from_environment(monkeypatch):
 
     monkeypatch.setenv("CREEM_MODE", "test")
     monkeypatch.setenv("COMMERCE_PUBLIC_URL", "http://localhost:8000")
+    for name, value in {
+        "CREEM_TEST_PRODUCT_ID": "prod_test",
+        "CREEM_TEST_API_KEY": "test-key",
+        "CREEM_TEST_WEBHOOK_SECRET": "test-secret",
+        "RESEND_API_KEY": "email-key",
+        "COMMERCE_EMAIL_FROM": "reports@example.com",
+        "COMMERCE_SUPPORT_EMAIL": "support@example.com",
+        "RECAPTCHA_SITE_KEY": "site",
+        "RECAPTCHA_SECRET_KEY": "secret",
+    }.items():
+        monkeypatch.setenv(name, value)
     for name in ("COMMERCE_RECAPTCHA_ENABLED", "COMMERCE_CHECKOUT_RATE_LIMIT", "COMMERCE_READ_RATE_LIMIT"):
         monkeypatch.delenv(name, raising=False)
     defaults = CommerceSettings.from_env()
@@ -1072,6 +1344,248 @@ def test_production_rejects_captcha_bypass_settings(overrides):
     settings = CommerceSettings(creem_mode="prod", public_url="https://reports.example.com", **overrides)
     with pytest.raises(ValueError, match="Production requires"):
         settings.validate()
+
+
+@pytest.fixture
+def commerce_environment(monkeypatch, tmp_path):
+    # Keep configuration tests independent of the developer's .env and providers.
+    monkeypatch.setattr("dotenv.load_dotenv", lambda **kwargs: None)
+    for name, value in {
+        "CREEM_MODE": "test",
+        "CREEM_TEST_PRODUCT_ID": "prod_test",
+        "CREEM_TEST_API_KEY": "private-test-api-key",
+        "CREEM_TEST_WEBHOOK_SECRET": "private-test-webhook-secret",
+        "CREEM_PROD_PRODUCT_ID": "prod_live",
+        "CREEM_PROD_API_KEY": "private-live-api-key",
+        "CREEM_PROD_WEBHOOK_SECRET": "private-live-webhook-secret",
+        "COMMERCE_DATA_DIR": str(tmp_path / "storefront"),
+        "COMMERCE_PUBLIC_URL": "https://reports.example.com",
+        "RESEND_API_KEY": "private-email-key",
+        "COMMERCE_EMAIL_FROM": "reports@example.com",
+        "COMMERCE_SUPPORT_EMAIL": "support@example.com",
+        "COMMERCE_RECAPTCHA_ENABLED": "true",
+        "RECAPTCHA_SITE_KEY": "site-key",
+        "RECAPTCHA_SECRET_KEY": "private-captcha-secret",
+    }.items():
+        monkeypatch.setenv(name, value)
+    return tmp_path / "storefront"
+
+
+@pytest.mark.parametrize("mode", ["test", "prod"])
+def test_creem_mode_uses_only_selected_configuration(commerce_environment, monkeypatch, mode):
+    from tradingagents.commerce.config import CommerceSettings
+    from tradingagents.commerce.creem import CreemClient
+
+    monkeypatch.setenv("CREEM_MODE", mode)
+    other = "PROD" if mode == "test" else "TEST"
+    for suffix in ("PRODUCT_ID", "API_KEY", "WEBHOOK_SECRET"):
+        monkeypatch.delenv(f"CREEM_{other}_{suffix}")
+        monkeypatch.setenv(f"CREEM_{suffix}", "legacy-must-not-be-used")
+    settings = CommerceSettings.from_env()
+    expected = "test" if mode == "test" else "live"
+    assert settings.creem_mode == mode
+    assert settings.product_id == f"prod_{expected}"
+    assert settings.creem_api_key == f"private-{expected}-api-key"
+    assert settings.webhook_secret == f"private-{expected}-webhook-secret"
+    assert settings.resend_api_key == "private-email-key"
+    assert settings.data_dir == commerce_environment
+    assert settings.recaptcha_enabled
+    client = CreemClient(settings)
+    assert client.base_url == ("https://test-api.creem.io" if mode == "test" else "https://api.creem.io")
+    for suffix in ("PRODUCT_ID", "API_KEY", "WEBHOOK_SECRET"):
+        with monkeypatch.context() as context:
+            variable = f"CREEM_{mode.upper()}_{suffix}"
+            context.delenv(variable)
+            context.setenv(f"CREEM_{other}_{suffix}", "other-mode-must-not-be-used")
+            with pytest.raises(ValueError, match=variable):
+                CommerceSettings.from_env()
+
+
+@pytest.mark.parametrize("environment_mode,cli_mode,expected", [
+    (None, None, "test"),
+    ("prod", None, "prod"),
+    ("prod", "test", "test"),
+    ("test", "prod", "prod"),
+])
+def test_commerce_cli_selects_creem_mode(commerce_environment, monkeypatch, environment_mode, cli_mode, expected):
+    from unittest.mock import Mock
+
+    pytest.importorskip("uvicorn")
+    from tradingagents.commerce.config import CommerceSettings
+    from tradingagents.mvp.cli import main
+
+    if environment_mode is None:
+        monkeypatch.delenv("CREEM_MODE")
+    else:
+        monkeypatch.setenv("CREEM_MODE", environment_mode)
+    server = Mock()
+    monkeypatch.setattr("uvicorn.run", server)
+    main(["serve"] + (["--mode", cli_mode] if cli_mode else []))
+    server.assert_called_once()
+    assert server.call_args.args == ("tradingagents.mvp.app:create_app",)
+    assert server.call_args.kwargs["factory"] is True
+    settings = CommerceSettings.from_env()
+    assert settings.creem_mode == expected
+    assert settings.product_id == ("prod_test" if expected == "test" else "prod_live")
+    assert not commerce_environment.exists()
+
+
+def test_commerce_cli_rejects_missing_configuration_before_start(commerce_environment, monkeypatch, capsys):
+    from unittest.mock import Mock
+
+    pytest.importorskip("uvicorn")
+    from tradingagents.mvp.cli import main
+
+    missing = ("CREEM_TEST_WEBHOOK_SECRET", "RECAPTCHA_SITE_KEY", "RECAPTCHA_SECRET_KEY")
+    for variable in missing:
+        monkeypatch.delenv(variable)
+    server = Mock()
+    monkeypatch.setattr("uvicorn.run", server)
+    with pytest.raises(SystemExit) as exc:
+        main(["serve", "--mode", "test"])
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "Missing configuration for Creem test mode" in error
+    assert all(variable in error for variable in missing)
+    assert "private-" not in error
+    assert "Traceback" not in error
+    server.assert_not_called()
+    assert not commerce_environment.exists()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("price,currency,tax_mode,label", [
+    (1900, "USD", "exclusive", "19.00"),
+    (1234, "EUR", "inclusive", "12.34"),
+])
+def test_creem_price_drives_page_order_payment_and_refund(commerce, price, currency, tax_mode, label):
+    import re
+    import uuid
+
+    c = commerce
+    c.transport.product.update(price=price, currency=currency, tax_mode=tax_mode)
+    home = c.client.get("/")
+    assert home.status_code == 200
+    assert f'Generate report — {currency} {label}' in home.text
+    assert ("Tax included" if tax_mode == "inclusive" else "Tax calculated at checkout") in home.text
+    assert "$5.99" not in home.text and c.settings.creem_api_key not in home.text
+    quote = re.search(r'data-product-quote="([a-f0-9]{64})"', home.text)[1]
+    key = uuid.uuid4().hex
+    response = c.client.post("/api/orders", json={"ticker": "AAPL", "product_quote": quote},
+                             headers={"Idempotency-Key": key})
+    assert response.status_code == 200
+    order = c.store.get_order(key, by="idempotency_key")
+    assert (order["amount"], order["currency"], order["tax_mode"]) == (price, currency, tax_mode)
+    assert c.transport.checkouts[0]["product_id"] == order["product_id"]
+    assert "price" not in c.transport.checkouts[0]
+
+    # Creem may expand today's product metadata for yesterday's checkout.
+    event = c.event(order)
+    c.transport.product.update(price=9900, currency="GBP", tax_mode="exclusive")
+    event["object"]["product"].update(price=9900, currency="GBP", tax_mode="exclusive")
+    assert c.post_event(event).json()["result"] == "PROCESSED"
+    assert len(c.store.tasks.list_runs()) == 1
+    completed = c.finish(order)
+    assert completed["amount"] == price and completed["currency"] == currency
+    refund = {"id": "evt_" + uuid.uuid4().hex, "eventType": "refund.created", "object": {
+        "status": "succeeded", "refund_currency": currency,
+        "transaction": {"id": "tran_" + order["id"], "order": "ord_" + order["id"],
+                        "status": "refunded", "mode": "test", "currency": currency},
+    }}
+    assert c.post_event(refund).json()["result"] == "PROCESSED"
+    assert c.store.get_order(order["id"])["status"] == "REFUNDED"
+
+
+@pytest.mark.integration
+def test_price_change_requires_page_refresh_before_checkout(commerce):
+    import re
+
+    c = commerce
+    page = c.client.get("/")
+    old_quote = re.search(r'data-product-quote="([a-f0-9]{64})"', page.text)[1]
+    c.transport.product.update(price=1900, tax_mode="exclusive")
+    payload = {"ticker": "AAPL", "product_quote": old_quote}
+    response = c.client.post("/api/orders", json=payload, headers={"Idempotency-Key": "a" * 32})
+    assert response.status_code == 409 and "Reload" in response.json()["detail"]
+    assert not c.transport.checkouts and not c.validated
+    assert c.store.get_order("a" * 32, by="idempotency_key") is None
+    refreshed = c.client.get("/")
+    assert "USD 19.00" in refreshed.text
+    new_quote = re.search(r'data-product-quote="([a-f0-9]{64})"', refreshed.text)[1]
+    assert old_quote != new_quote
+    payload["product_quote"] = new_quote
+    assert c.client.post("/api/orders", json=payload, headers={"Idempotency-Key": "b" * 32}).status_code == 200
+
+
+@pytest.mark.integration
+def test_product_cache_expires_and_failed_refresh_never_uses_stale_price(commerce, monkeypatch):
+    from tradingagents.commerce import creem
+
+    c = commerce
+    clock = [100.0]
+    monkeypatch.setattr(creem.time, "monotonic", lambda: clock[0])
+    assert c.client.get("/").status_code == 200
+    c.transport.product["price"] = 1900
+    assert "USD 5.99" in c.client.get("/").text
+    assert len(c.transport.requests) == 1
+    clock[0] = 160.0
+    assert "USD 19.00" in c.client.get("/").text
+    assert len(c.transport.requests) == 2
+    c.transport.product_unavailable = True
+    response = c.client.post("/api/orders", json={"ticker": "AAPL"}, headers={"Idempotency-Key": "a" * 32})
+    assert response.status_code == 503
+    assert c.store.get_order("a" * 32, by="idempotency_key") is None
+    home = c.client.get("/")
+    assert home.status_code == 503
+    assert "Price temporarily unavailable" in home.text and "USD 19.00" not in home.text
+    assert not c.transport.checkouts
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("field,value", [
+    ("price", 0), ("price", -1), ("price", True), ("price", "1900"),
+    ("currency", None), ("currency", "<USD>"), ("tax_mode", None), ("tax_mode", []),
+    ("billing_type", "recurring"), ("mode", "prod"), ("status", "archived"), ("id", "prod_other"),
+])
+def test_invalid_creem_product_cannot_create_order(commerce, field, value):
+    c = commerce
+    c.transport.product[field] = value
+    response = c.client.post("/api/orders", json={"ticker": "AAPL"}, headers={"Idempotency-Key": "a" * 32})
+    assert response.status_code == 503
+    assert c.store.get_order("a" * 32, by="idempotency_key") is None
+    assert not c.transport.checkouts and not c.validated
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("overrides", [
+    {"amount_paid": 1900}, {"amount_due": 1900}, {"sub_total": 1},
+    {"tax_amount": -1}, {"tax_amount": True}, {"tax_amount": "100"}, {"discount_amount": 1},
+])
+def test_exclusive_tax_payment_still_requires_exact_total(commerce, overrides):
+    c = commerce
+    c.transport.product.update(price=1900, tax_mode="exclusive")
+    order = c.purchase()
+    event = c.event(order)
+    event["object"]["order"].update(overrides)
+    assert c.post_event(event).json()["result"] == "REJECTED"
+    assert not c.store.tasks.list_runs()
+
+
+@pytest.mark.integration
+def test_legacy_price_orders_gain_inclusive_tax_mode_without_repricing(commerce):
+    from tradingagents.commerce.store import CommerceStore
+
+    c = commerce
+    order = c.purchase()
+    with c.store.tasks.transaction() as connection:
+        connection.execute("ALTER TABLE trade_orders DROP COLUMN tax_mode")
+    migrated = CommerceStore(c.settings)
+    restored = migrated.get_order(order["id"])
+    assert (restored["amount"], restored["currency"], restored["tax_mode"]) == (599, "USD", "inclusive")
+    assert restored["creem_checkout_id"] == order["creem_checkout_id"]
+    assert CommerceStore(c.settings).get_order(order["id"]) == restored
+    c.transport.product.update(price=1900, tax_mode="exclusive")
+    assert c.post_event(c.event(restored)).json()["result"] == "PROCESSED"
 
 
 @pytest.mark.integration
