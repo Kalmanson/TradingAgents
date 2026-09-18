@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from functools import partial
 from typing import Annotated
@@ -9,6 +10,8 @@ from .market_data import get_stock_data
 from .stockstats_utils import filter_financials_by_date
 from .symbol_utils import NoMarketDataError, normalize_symbol
 from .yahoo import yf_retry
+
+logger = logging.getLogger(__name__)
 
 # Keep the existing provider entry points while using shared implementations.
 get_YFin_data_online = partial(get_stock_data, vendor="yfinance")
@@ -81,6 +84,9 @@ def get_fundamentals(
     except NoMarketDataError:
         raise
     except Exception as e:
+        # 降级为错误字符串返回给 agent；记录日志以便区分网络故障与数据缺失。
+        logger.warning("yfinance 基本面获取失败 event=yfinance_fundamentals_failed ticker=%s error_type=%s error=%s",
+                       ticker, type(e).__name__, str(e)[:200])
         return f"Error retrieving fundamentals for {ticker}: {str(e)}"
 
 
@@ -116,6 +122,8 @@ def get_balance_sheet(
     except NoMarketDataError:
         raise
     except Exception as e:
+        logger.warning("yfinance 资产负债表获取失败 event=yfinance_balance_sheet_failed ticker=%s error_type=%s error=%s",
+                       ticker, type(e).__name__, str(e)[:200])
         return f"Error retrieving balance sheet for {ticker}: {str(e)}"
 
 
@@ -151,6 +159,8 @@ def get_cashflow(
     except NoMarketDataError:
         raise
     except Exception as e:
+        logger.warning("yfinance 现金流获取失败 event=yfinance_cashflow_failed ticker=%s error_type=%s error=%s",
+                       ticker, type(e).__name__, str(e)[:200])
         return f"Error retrieving cash flow for {ticker}: {str(e)}"
 
 
@@ -186,6 +196,8 @@ def get_income_statement(
     except NoMarketDataError:
         raise
     except Exception as e:
+        logger.warning("yfinance 利润表获取失败 event=yfinance_income_statement_failed ticker=%s error_type=%s error=%s",
+                       ticker, type(e).__name__, str(e)[:200])
         return f"Error retrieving income statement for {ticker}: {str(e)}"
 
 
@@ -213,4 +225,6 @@ def get_insider_transactions(
         return header + csv_string
 
     except Exception as e:
+        logger.warning("yfinance 内部人交易获取失败 event=yfinance_insider_failed ticker=%s error_type=%s error=%s",
+                       ticker, type(e).__name__, str(e)[:200])
         return f"Error retrieving insider transactions for {ticker}: {str(e)}"

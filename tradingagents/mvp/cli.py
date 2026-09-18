@@ -71,7 +71,11 @@ def main(argv=None) -> None:
         log_config["handlers"]["commerce"] = {
             "class": "logging.StreamHandler", "formatter": "commerce", "stream": "ext://sys.stderr",
         }
-        for name in ("tradingagents.commerce", "tradingagents.mvp"):
+        # 同时接入分析与数据源日志：任务生命周期、LLM 调用失败和数据源降级
+        # 都发生在这些模块里，排障时需要与 commerce 日志同处一个输出流。
+        for name in ("tradingagents.commerce", "tradingagents.mvp",
+                     "tradingagents.application", "tradingagents.dataflows",
+                     "tradingagents.llm_clients"):
             log_config["loggers"][name] = {
                 "handlers": ["commerce"], "level": args.log_level.upper(), "propagate": False,
             }

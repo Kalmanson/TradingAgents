@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import logging
 import os
 import re
 import threading
@@ -51,6 +52,8 @@ FIXED_AGENTS = (
 )
 CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._^=-]{1,32}$")
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_ticker(value: str, config: dict | None = None) -> str:
@@ -429,6 +432,12 @@ class AnalysisRunner:
                 "asset_type": request.asset_type,
             },
         )
+        logger.info(
+            "分析开始 event=analysis_started ticker=%s date=%s asset_type=%s provider=%s "
+            "quick_llm=%s deep_llm=%s analysts=%s",
+            request.ticker, request.analysis_date, request.asset_type, request.llm_provider,
+            request.quick_think_llm, request.deep_think_llm, ",".join(request.analysts),
+        )
         try:
             graph = self.graph_factory(
                 request.analysts,
@@ -466,6 +475,9 @@ class AnalysisRunner:
                 yield from tracker.process(chunk)
                 yield AnalysisEvent("stats", self.stats_handler.get_stats())
                 if token.is_cancelled():
+                    logger.info(
+                        "用户取消分析 event=analysis_stopped ticker=%s", request.ticker,
+                    )
                     yield AnalysisEvent(
                         "stopped",
                         {"message": "停止请求已生效，可稍后从 checkpoint 恢复。"},
@@ -495,12 +507,20 @@ class AnalysisRunner:
                 "analyst_wall_time_summary": tracker.wall_time.format_summary(),
             }
             result = AnalysisResult(final_state, signal, report_path, stats)
+            logger.info(
+                "分析完成 event=analysis_completed ticker=%s signal=%s elapsed_seconds=%.1f",
+                request.ticker, signal, stats["elapsed_seconds"],
+            )
             yield AnalysisEvent(
                 "completed",
                 {"message": "分析完成。"},
                 result=result,
             )
         except Exception as exc:
+            logger.error(
+                "分析失败 event=analysis_failed ticker=%s error_type=%s error=%s",
+                request.ticker, type(exc).__name__, _safe_error(exc),
+            )
             yield AnalysisEvent(
                 "failed",
                 {"error": _safe_error(exc)},

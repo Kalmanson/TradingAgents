@@ -1,5 +1,7 @@
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -11,6 +13,8 @@ from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
 from .validators import validate_model
+
+logger = logging.getLogger(__name__)
 
 
 class NormalizedChatOpenAI(ChatOpenAI):
@@ -33,7 +37,18 @@ class NormalizedChatOpenAI(ChatOpenAI):
     """
 
     def invoke(self, input, config=None, **kwargs):
-        return normalize_content(super().invoke(input, config, **kwargs))
+        # 所有 OpenAI 兼容提供商的 LLM 请求都经过这里；DEBUG 级别记录模型与耗时，
+        # 便于排查慢请求，且默认不产生噪声。
+        started = time.monotonic()
+        try:
+            result = normalize_content(super().invoke(input, config, **kwargs))
+        except Exception as exc:
+            logger.warning("LLM 调用失败 event=llm_invoke_failed model=%s error_type=%s",
+                           self.model_name, type(exc).__name__)
+            raise
+        logger.debug("LLM 调用完成 event=llm_invoke model=%s elapsed_ms=%.0f",
+                     self.model_name, (time.monotonic() - started) * 1000)
+        return result
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
         caps = get_capabilities(self.model_name)

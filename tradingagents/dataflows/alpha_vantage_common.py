@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import time
 from datetime import datetime
 from io import StringIO
 
@@ -7,6 +9,8 @@ import pandas as pd
 import requests
 
 from .errors import VendorNotConfiguredError, VendorRateLimitError
+
+logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://www.alphavantage.co/query"
 
@@ -83,10 +87,20 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
         # Remove entitlement if it's None or empty
         api_params.pop("entitlement", None)
 
-    response = requests.get(API_BASE_URL, params=api_params, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    started = time.monotonic()
+    try:
+        response = requests.get(API_BASE_URL, params=api_params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("market_data_request provider=alpha_vantage endpoint=%s status=network_error error_type=%s elapsed_ms=%d",
+                       function_name, type(exc).__name__, round((time.monotonic() - started) * 1000))
+        raise
 
     response_text = response.text
+    # getattr 兼容测试替身：部分 fake response 只实现 text/raise_for_status。
+    logger.info("market_data_request provider=alpha_vantage endpoint=%s status=%s elapsed_ms=%d",
+                function_name, getattr(response, "status_code", "unknown"),
+                round((time.monotonic() - started) * 1000))
 
     # Error responses are JSON; data responses are usually CSV (or data-keyed
     # JSON). A non-JSON body is normal data.
@@ -103,10 +117,12 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
     if notice:
         low = notice.lower()
         if any(m in low for m in ("rate limit", "requests per day", "call frequency", "premium")):
+            logger.warning("Alpha Vantage 触发限流 event=alpha_vantage_rate_limited endpoint=%s", function_name)
             raise AlphaVantageRateLimitError(f"Alpha Vantage rate limit exceeded: {notice}")
         if "api key" in low or "apikey" in low:
             # Reuse the existing "not configured" error so a bad key surfaces as
             # a real, actionable failure rather than a mislabeled rate limit (#991).
+            logger.warning("Alpha Vantage API key 无效 event=alpha_vantage_key_invalid endpoint=%s", function_name)
             raise AlphaVantageNotConfiguredError(f"Alpha Vantage API key invalid or missing: {notice}")
 
     return response_text
@@ -147,5 +163,6 @@ def _filter_csv_by_date_range(csv_data: str, start_date: str, end_date: str) -> 
 
     except Exception as e:
         # If filtering fails, return original data with a warning
-        print(f"Warning: Failed to filter CSV data by date range: {e}")
+        logger.warning("Alpha Vantage CSV 日期过滤失败，返回未过滤数据 event=alpha_vantage_filter_failed error_type=%s error=%s",
+                       type(e).__name__, str(e)[:200])
         return csv_data

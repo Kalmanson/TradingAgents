@@ -1,5 +1,9 @@
 
+import logging
+
 from .base_client import BaseLLMClient
+
+logger = logging.getLogger(__name__)
 
 
 def create_llm_client(
@@ -27,6 +31,8 @@ def create_llm_client(
         ValueError: If provider is not supported
     """
     provider_lower = provider.lower()
+    logger.debug("创建 LLM 客户端 event=llm_client_created provider=%s model=%s base_url=%s",
+                 provider_lower, model, base_url or "(默认)")
 
     # Native (non-OpenAI) APIs are matched first so their string check doesn't
     # import the OpenAI client. Everything else is OpenAI-compatible and routes

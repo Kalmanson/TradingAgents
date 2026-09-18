@@ -10,6 +10,7 @@ the routing layer treats it as "unavailable" rather than a hard crash.
 """
 import logging
 import os
+import time
 from datetime import datetime, timedelta
 
 import pytz
@@ -135,9 +136,18 @@ def _fred_today() -> str:
 def _request(path: str, params: dict) -> dict:
     """GET a FRED endpoint, surfacing FRED's JSON error body on a bad request."""
     api_params = {**params, "api_key": get_api_key(), "file_type": "json"}
-    response = requests.get(
-        f"{FRED_API_BASE}/{path}", params=api_params, timeout=REQUEST_TIMEOUT
-    )
+    started = time.monotonic()
+    try:
+        response = requests.get(
+            f"{FRED_API_BASE}/{path}", params=api_params, timeout=REQUEST_TIMEOUT
+        )
+        status = response.status_code
+    except requests.RequestException as exc:
+        logger.warning("market_data_request provider=fred endpoint=%s status=network_error error_type=%s elapsed_ms=%d",
+                       path, type(exc).__name__, round((time.monotonic() - started) * 1000))
+        raise
+    logger.info("market_data_request provider=fred endpoint=%s status=%s elapsed_ms=%d",
+                path, status, round((time.monotonic() - started) * 1000))
     # FRED returns 400 with a JSON {"error_message": ...} for unknown series IDs
     # or malformed params; turn that into a clear, actionable error.
     if response.status_code == 400:
@@ -195,6 +205,7 @@ def get_macro_data(
     try:
         series_id = _resolve_series_id(indicator)
     except ValueError as e:
+        logger.warning("FRED 指标别名无效，返回提示而非中断分析 event=fred_indicator_invalid indicator=%s", indicator)
         return f"FRED: {e}"
 
     meta = _request("series", {"series_id": series_id, **realtime}).get("seriess") or []

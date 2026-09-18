@@ -1,6 +1,7 @@
 """yfinance-based news data fetching functions."""
 
 import contextlib
+import logging
 from datetime import datetime, timezone
 
 import yfinance as yf
@@ -10,6 +11,8 @@ from .config import get_config
 from .date_window import in_window
 from .stockstats_utils import yf_retry
 from .symbol_utils import normalize_symbol
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_article_data(article: dict) -> dict:
@@ -117,6 +120,8 @@ def get_news_yfinance(
         return f"## {ticker}{resolved} News, from {start_date} to {end_date}:\n\n{news_str}"
 
     except Exception as e:
+        logger.warning("yfinance 个股新闻获取失败 event=yfinance_news_failed ticker=%s error_type=%s error=%s",
+                       ticker, type(e).__name__, str(e)[:200])
         return f"Error fetching news for {ticker}: {str(e)}"
 
 
@@ -205,4 +210,6 @@ def get_global_news_yfinance(
         return f"## Global Market News, from {start_date} to {curr_date}:\n\n{news_str}"
 
     except Exception as e:
+        logger.warning("yfinance 全球新闻获取失败 event=yfinance_global_news_failed error_type=%s error=%s",
+                       type(e).__name__, str(e)[:200])
         return f"Error fetching global news: {str(e)}"
