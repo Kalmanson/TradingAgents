@@ -122,8 +122,9 @@ class TaskStore:
         source: str = "ui",
         parent_run_id: str | None = None,
         connection: sqlite3.Connection | None = None,
+        config: dict | None = None,
     ) -> str:
-        normalized = request.normalized()
+        normalized = request.normalized(DEFAULT_CONFIG if config is None else config)
         normalized.validate()
         run_id = uuid.uuid4().hex[:12]
         with self.transaction() if connection is None else nullcontext(connection) as conn:

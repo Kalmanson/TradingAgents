@@ -15,14 +15,60 @@ from tradingagents.agents.utils.agent_utils import (
 )
 
 
+@pytest.mark.parametrize("symbol,changes,kind,exchange", [
+    ("AAPL", {}, "EQUITY", "XNAS"),
+    ("MSFT", {}, "EQUITY", "XNAS"),
+    ("BRK.B", {"exchange": "NYSE"}, "EQUITY", "XNYS"),
+    ("BRK-B", {"exchange": "NYSE"}, "EQUITY", "XNYS"),
+    ("SPY", {"isEtf": True, "exchange": "AMEX"}, "ETF", "XASE"),
+    ("TSM", {"isAdr": True, "country": "TW", "exchange": "NYSE"}, "EQUITY", "XNYS"),
+    ("AAPL", {"isEtf": None}, None, "XNAS"),
+    ("AAPL", {"isEtf": "false"}, None, "XNAS"),
+    ("AAPL", {"isActivelyTrading": False}, None, "XNAS"),
+    ("AAPL", {"exchange": "OTC"}, None, None),
+])
+def test_fmp_instrument_mapping_is_exact_and_purchase_safe(fmp_http, symbol, changes, kind, exchange):
+    from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.commerce.profile import validate_us_equity
+    from tradingagents.dataflows import market_data
+
+    profile = {"symbol": symbol.replace(".", "-"), "companyName": "Company", "exchange": "NASDAQ",
+               "isEtf": False, "isFund": False, "isActivelyTrading": True, **changes}
+    fmp_http.respond = lambda endpoint, params: (200, [profile])
+    config = {"data_vendors": {"instrument_data": "fmp"}}
+    info = market_data.get_instrument_info(symbol, config=config)
+    assert info["quote_type"] == kind and info["exchange"] == exchange
+    assert info["country"] == ("US" if exchange else None)
+    if kind == "EQUITY":
+        validate_us_equity(symbol, config=config)
+    else:
+        with pytest.raises((ValueError, ProviderUnavailable)):
+            validate_us_equity(symbol, config=config)
+
+
+def test_fmp_identity_failure_remains_ticker_only_and_does_not_reuse_yahoo(fmp_http, monkeypatch):
+    from tradingagents.dataflows import market_data
+    from tradingagents.dataflows.config import set_config
+    from tradingagents.dataflows.errors import VendorError
+
+    monkeypatch.setitem(market_data.INSTRUMENT_ADAPTERS, "yfinance", lambda symbol: {"company_name": "Yahoo Cached"})
+    market_data.get_instrument_info("AAPL", vendor="yfinance")
+    set_config({"data_vendors": {"instrument_data": "fmp"}})
+    fmp_http.respond = lambda endpoint, params: (200, [{"symbol": "MSFT", "companyName": "Wrong Company"}])
+    with pytest.raises(VendorError):
+        market_data.get_instrument_info("AAPL")
+    assert resolve_instrument_identity("AAPL") == {}
+
+
 @pytest.mark.unit
 class ResolveInstrumentIdentityTests(unittest.TestCase):
     def setUp(self):
-        resolve_instrument_identity.cache_clear()
+        from tradingagents.dataflows.market_data import _instrument_cache
+        _instrument_cache.clear()
 
     def test_resolves_company_metadata_from_yfinance(self):
-        with patch("tradingagents.agents.utils.agent_utils.yf.Ticker") as mock:
-            mock.return_value.info = {
+        with patch("tradingagents.dataflows.yahoo.yf.Ticker") as mock:
+            mock.return_value.get_info.return_value = {
                 "longName": "TOTO LTD.",
                 "shortName": "TOTO",
                 "sector": "Industrials",
@@ -38,27 +84,27 @@ class ResolveInstrumentIdentityTests(unittest.TestCase):
         self.assertEqual(identity["exchange"], "PNK")
 
     def test_falls_back_to_short_name(self):
-        with patch("tradingagents.agents.utils.agent_utils.yf.Ticker") as mock:
-            mock.return_value.info = {"shortName": "TOTO", "sector": "Industrials"}
+        with patch("tradingagents.dataflows.yahoo.yf.Ticker") as mock:
+            mock.return_value.get_info.return_value = {"shortName": "TOTO", "sector": "Industrials"}
             identity = resolve_instrument_identity("TOTDY")
         self.assertEqual(identity["company_name"], "TOTO")
 
     def test_skips_placeholder_values(self):
-        with patch("tradingagents.agents.utils.agent_utils.yf.Ticker") as mock:
-            mock.return_value.info = {"longName": "  ", "sector": "None", "industry": "n/a"}
+        with patch("tradingagents.dataflows.yahoo.yf.Ticker") as mock:
+            mock.return_value.get_info.return_value = {"longName": "  ", "sector": "None", "industry": "n/a"}
             identity = resolve_instrument_identity("TOTDY")
         self.assertEqual(identity, {})
 
     def test_fails_open_on_exception(self):
         with patch(
-            "tradingagents.agents.utils.agent_utils.yf.Ticker",
+            "tradingagents.dataflows.yahoo.yf.Ticker",
             side_effect=RuntimeError("rate limited"),
         ):
             self.assertEqual(resolve_instrument_identity("TOTDY"), {})
 
     def test_result_is_cached(self):
-        with patch("tradingagents.agents.utils.agent_utils.yf.Ticker") as mock:
-            mock.return_value.info = {"longName": "TOTO LTD."}
+        with patch("tradingagents.dataflows.yahoo.yf.Ticker") as mock:
+            mock.return_value.get_info.return_value = {"longName": "TOTO LTD."}
             first = resolve_instrument_identity("TOTDY")
             second = resolve_instrument_identity("TOTDY")
         mock.assert_called_once()  # second call served from cache
@@ -104,7 +150,7 @@ class GetInstrumentContextFromStateTests(unittest.TestCase):
 
     def test_fallback_is_network_free_ticker_only(self):
         # No instrument_context and no yfinance call — must not hit the network.
-        with patch("tradingagents.agents.utils.agent_utils.yf.Ticker") as mock:
+        with patch("tradingagents.dataflows.yahoo.yf.Ticker") as mock:
             context = get_instrument_context_from_state(
                 {"company_of_interest": "NVDA", "asset_type": "stock"}
             )
@@ -168,3 +214,71 @@ class ContextAnchoredPlaceholderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("ticker,kind,exchange,country,outcome", [
+    ("AAPL", "equity", "XNAS", "USA", "ok"),
+    ("MSFT", "equity", "XNAS", "US", "ok"),
+    ("BRK-B", "equity", "XNYS", "USA", "ok"),
+    ("BRK.B", "equity", "XNYS", "USA", "ok"),
+    ("SPY", "etf", "ARCX", "USA", "unsupported"),
+    ("AAPL", "equity", "XLON", "GBR", "unsupported"),
+    ("AAPL", None, "XNAS", "USA", "unverifiable"),
+    ("AAPL", "equity", None, "USA", "unverifiable"),
+])
+def test_marketstack_purchase_validation_uses_own_configuration(monkeypatch, ticker, kind, exchange, country, outcome):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.commerce.profile import validate_us_equity
+    from tradingagents.dataflows import marketstack, yahoo
+    from tradingagents.dataflows.config import set_config
+
+    # Global research defaults must not determine storefront eligibility.
+    set_config({"data_vendors": {"instrument_data": "yfinance"}})
+    config = {"data_vendors": {"instrument_data": "marketstack"}}
+    monkeypatch.setenv("MARKETSTACK_API_KEY", "key")
+    monkeypatch.setattr(yahoo.yf, "Ticker", Mock(side_effect=AssertionError("Unexpected Yahoo")))
+    requested = []
+
+    def respond(url, **kwargs):
+        requested.append(url)
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: {
+            "symbol": ticker.replace("-", "."), "name": "Verified company", "item_type": kind,
+            "stock_exchange": {"mic": exchange, "country_code": country},
+        })
+
+    monkeypatch.setattr(marketstack.requests, "get", respond)
+    if outcome == "ok":
+        validate_us_equity(ticker, config=config)
+    else:
+        with pytest.raises(ProviderUnavailable if outcome == "unverifiable" else ValueError):
+            validate_us_equity(ticker, config=config)
+    assert requested == [f"https://api.marketstack.com/v2/tickers/{ticker.replace('-', '.')}" ]
+    yahoo.yf.Ticker.assert_not_called()
+
+
+def test_identity_cache_is_provider_specific_and_does_not_hide_purchase_outage(monkeypatch):
+    from unittest.mock import Mock
+
+    from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.commerce.profile import validate_us_equity
+    from tradingagents.dataflows import market_data
+    from tradingagents.dataflows.config import set_config
+    from tradingagents.dataflows.errors import VendorError
+
+    yahoo = Mock(return_value={"provider": "yfinance", "company_name": "Yahoo name"})
+    marketstack = Mock(return_value={"provider": "marketstack", "company_name": "Marketstack name",
+                                   "quote_type": "EQUITY", "exchange": "XNAS", "country": "US"})
+    monkeypatch.setitem(market_data.INSTRUMENT_ADAPTERS, "yfinance", yahoo)
+    monkeypatch.setitem(market_data.INSTRUMENT_ADAPTERS, "marketstack", marketstack)
+    assert resolve_instrument_identity("AAPL")["company_name"] == "Yahoo name"
+    set_config({"data_vendors": {"instrument_data": "marketstack"}})
+    assert resolve_instrument_identity("AAPL")["company_name"] == "Marketstack name"
+    assert resolve_instrument_identity("AAPL")["company_name"] == "Marketstack name"
+    marketstack.assert_called_once()
+    marketstack.side_effect = VendorError("Service unavailable")
+    with pytest.raises(ProviderUnavailable):
+        validate_us_equity("AAPL")  # refresh, even though research has a cached identity
+    assert marketstack.call_count == 2

@@ -206,7 +206,8 @@ class CommerceStore:
                 run_id = None
                 if not refunded:
                     request = AnalysisRequest.from_dict(profile["request"])
-                    run_id = self.tasks.create_run(request, source="commerce", connection=connection)
+                    run_id = self.tasks.create_run(request, source="commerce", connection=connection,
+                                                   config=profile["config"])
                     queued_run_id = run_id
                 final_status = "REFUNDED" if refunded else "PAID"
                 connection.execute("""UPDATE trade_orders SET status = ?, creem_checkout_id = ?,

@@ -141,3 +141,18 @@ def normalize_symbol(raw: str) -> str:
 def is_yahoo_safe(symbol: str) -> bool:
     """True when ``symbol`` only contains characters Yahoo symbols use."""
     return bool(symbol) and _YAHOO_SAFE.fullmatch(symbol) is not None
+
+
+def normalize_input_symbol(raw: str, config: dict | None = None) -> str:
+    """Preserve legacy Yahoo input aliases only when that supplier is selected.
+
+    Other adapters receive the user's equity symbol, so a real stock such as
+    GOLD cannot accidentally become Yahoo's GC=F futures contract.
+    """
+    if config is None:
+        from .config import get_config
+        config = get_config()
+    selected = config.get("tool_vendors", {}).get("get_stock_data") or config.get(
+        "data_vendors", {}).get("core_stock_apis", "yfinance")
+    primary = selected.split(",")[0].strip()
+    return normalize_symbol(raw) if primary in {"yfinance", "default", ""} else raw.strip().upper()

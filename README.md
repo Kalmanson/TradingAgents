@@ -176,9 +176,10 @@ You will see a screen where you can select your desired tickers, analysis date, 
 价格、币种和税费方式从 Creem 商品读取，首页与订单使用相同来源；订单保存下单时的价格供支付核验。
 安装 `pip install ".[mvp]"` 并补齐 `.env` 后，运行 `tradingagents-mvp serve --mode test` 或 `--mode prod`。
 同一 `.env` 用 `CREEM_TEST_*`、`CREEM_PROD_*` 区分 Creem 凭据，其他配置共用；缺少必填项会直接拒绝启动并列出配置项。
+付费入口默认使用 FMP 行情、证券资料、基本面、财报、新闻和内部人交易，指标在本地计算；填写 `FMP_API_KEY` 并确认对应接口权限后使用。本地 CLI 和 Web 工作台默认仍使用 yfinance。
 
 中文文档：[系统架构](docs/付费报告系统架构.md) · [部署与运行](docs/付费报告部署与运行.md) · [文档入口](docs/PAID_REPORT_MVP.md)。
-部署文档包含订单离线查询、报告导出、数据库备份恢复和常见故障处理的完整命令。
+部署文档包含订单离线查询、报告导出、数据库备份恢复，以及 [FMP 配置与回滚](docs/付费报告部署与运行.md#34-fmp-数据源配置与回滚)、真实接口验收和常见故障处理。
 
 ### Local Web Workbench
 
@@ -197,7 +198,7 @@ available.
 
 ### Markets and tickers
 
-TradingAgents works with any market Yahoo Finance covers, using the exchange-suffixed ticker. Company identity and the alpha benchmark resolve automatically per market.
+With the default Yahoo configuration, TradingAgents supports the markets below using exchange-suffixed tickers. Company identity and the alpha benchmark resolve automatically per market. The [FMP and Marketstack adapters](#fmp-primary-data-source) currently support US stocks/ETFs; they do not replace Yahoo coverage for other markets.
 
 - US: `AAPL`, `SPY`
 - Hong Kong: `0700.HK` · Tokyo: `7203.T` · London: `AZN.L`
@@ -218,6 +219,99 @@ An interface will appear showing results as they load, letting you track the age
 <p align="center">
   <img src="assets/cli/cli_transaction.png" width="100%" style="display: inline-block; margin: 0 2%;">
 </p>
+
+### FMP primary data source
+
+FMP uses the pinned `fmpsdk==20260824.0` client for its stable API. Defaults
+are isolated by entry point; setting only `FMP_API_KEY` preserves this split:
+
+| Entry point | Prices / identity | Indicators | Fundamentals / statements | News / insider trades |
+| --- | --- | --- | --- | --- |
+| Paid storefront (`tradingagents-mvp serve`, test or prod) | `fmp` | `local` | `fmp` | `fmp` |
+| Local CLI / Web workbench | `yfinance` | `yfinance` | `yfinance` | `yfinance` |
+
+```dotenv
+FMP_API_KEY=your-key
+# Optional overrides apply to EVERY entry point using this environment:
+#TRADINGAGENTS_CORE_STOCK_VENDOR=fmp
+#TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR=local
+#TRADINGAGENTS_INSTRUMENT_VENDOR=fmp
+#TRADINGAGENTS_FUNDAMENTAL_VENDOR=fmp
+#TRADINGAGENTS_NEWS_VENDOR=fmp
+```
+
+The equivalent configuration is:
+
+```python
+from copy import deepcopy
+from tradingagents.default_config import DEFAULT_CONFIG
+
+config = deepcopy(DEFAULT_CONFIG)
+config["data_vendors"].update({
+    "core_stock_apis": "fmp",
+    "technical_indicators": "local",
+    "instrument_data": "fmp",
+    "fundamental_data": "fmp",
+    "news_data": "fmp",  # includes insider transactions
+})
+```
+
+`tool_vendors` takes precedence over category settings. `get_stock_data`
+controls prices, local indicators, verification and realized returns;
+`get_instrument_info` controls identity and purchase eligibility. Explicit
+`CommerceService(base_config=...)` is respected. Fallbacks use only the
+configured comma-separated chain: selecting `fmp` alone never calls Yahoo.
+`default` allows all registered providers and should not be used when the
+source must be restricted. The legacy `yfinance` indicator option still
+explicitly uses Yahoo prices.
+
+Daily OHLC is dividend adjusted; raw volume is joined from the unadjusted
+endpoint by exact symbol and trading date. Missing prices or volume are
+rejected. The five-year indicator window, inclusive dates, stale-data guards
+and provider-isolated caches are shared with existing adapters. Reports show
+the latest available trading day; daily prices are not real-time quotes.
+`BRK.B` and `BRK-B` resolve to the same share class. ETFs work for prices and
+benchmarks, but cannot be purchased. Missing instrument flags or unsupported
+exchanges block checkout; US-listed ADRs use listing country, not headquarters.
+
+FMP fundamentals use current profile, quote, TTM ratios and key metrics.
+Unavailable fields are marked `N/A`; current snapshots are unavailable for
+historical analysis. Statements retain financial period, currency and
+filing/acceptance dates, and omit records without verifiable disclosure dates
+or disclosed after the cutoff. This does not provide historical restatement
+vintages. News is paginated, date-filtered and deduplicated; `global_news_queries`
+applies only to Yahoo search. Insider data is the latest up to 100 records,
+with transaction and filing dates, not a historical as-of query.
+
+SDK retries are disabled. The adapter retries transient failures at most twice,
+but does not retry authentication, plan permissions or exhausted quotas. Logs
+contain endpoint names, request counts, latency and data dates, never API keys
+or upstream exception bodies. Enable INFO on `tradingagents.dataflows.fmp` and
+`tradingagents.dataflows.market_data`; the storefront log-level flag only
+controls commerce/MVP logs.
+
+New orders save effective vendor settings without keys. Existing orders retain
+their original settings. To roll back new paid orders to Yahoo, explicitly set
+all five selectors to `yfinance` and remove conflicting tool overrides. Removing
+overrides restores FMP defaults for the storefront and Yahoo for local CLI/Web.
+
+The SDK's BSD license does not license FMP data for paid reports. FMP requires
+an appropriate data display/redistribution agreement; confirm endpoint access,
+report/chart display, derived outputs and caching with your commercial contract.
+Other sources (macro, prediction markets, social feeds) retain their own routing
+and licensing. See [FMP commercial plans](https://site.financialmodelingprep.com/developer/docs/pricing?planType=commercial),
+[configuration and rollback](docs/付费报告部署与运行.md#34-fmp-数据源配置与回滚)
+and [live smoke tests](docs/付费报告部署与运行.md#113-fmp-真实接口验收).
+
+### Marketstack daily market data
+
+Marketstack remains available for US daily prices and instrument identity.
+Set `MARKETSTACK_API_KEY`, select `marketstack` for `core_stock_apis` and
+`instrument_data`, and `local` for indicators. Fundamentals and news retain
+their separately configured provider (FMP in the paid storefront). Marketstack
+uses V2 EOD/ticker endpoints, complete pagination, adjusted OHLC/raw volume and
+isolated caches. See [Marketstack plans](https://marketstack.com/pricing) and
+[service agreements](https://www.ideracorp.com/legal/APILayer) for licensing.
 
 ## TradingAgents Package
 

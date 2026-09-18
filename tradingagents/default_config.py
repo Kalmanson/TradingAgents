@@ -8,6 +8,11 @@ _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
 # of the existing default, so users can keep writing plain strings in
 # their .env file.
 _ENV_OVERRIDES = {
+    "TRADINGAGENTS_CORE_STOCK_VENDOR": "data_vendors.core_stock_apis",
+    "TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR": "data_vendors.technical_indicators",
+    "TRADINGAGENTS_INSTRUMENT_VENDOR": "data_vendors.instrument_data",
+    "TRADINGAGENTS_FUNDAMENTAL_VENDOR": "data_vendors.fundamental_data",
+    "TRADINGAGENTS_NEWS_VENDOR": "data_vendors.news_data",
     "TRADINGAGENTS_LLM_PROVIDER":         "llm_provider",
     "TRADINGAGENTS_DEEP_THINK_LLM":       "deep_think_llm",
     "TRADINGAGENTS_QUICK_THINK_LLM":      "quick_think_llm",
@@ -63,7 +68,11 @@ def _apply_env_overrides(config: dict) -> dict:
         if raw is None or raw == "":
             continue
         try:
-            config[key] = _coerce(raw, config.get(key))
+            if key.startswith("data_vendors."):
+                category = key.split(".", 1)[1]
+                config["data_vendors"][category] = raw.strip()
+            else:
+                config[key] = _coerce(raw, config.get(key))
         except ValueError as exc:
             raise ValueError(f"Invalid value for {env_var}: {exc}") from exc
     return config
@@ -137,10 +146,11 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # routed to vendors you didn't choose. For ordered fallback, list several,
     # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
     "data_vendors": {
-        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
-        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
-        "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance, marketstack, fmp
+        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance, local
+        "instrument_data": "yfinance",       # Options: yfinance, marketstack, fmp
+        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance, fmp
+        "news_data": "yfinance",             # Options: alpha_vantage, yfinance, fmp
         "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
         "prediction_markets": "polymarket",  # Options: polymarket (keyless)
     },

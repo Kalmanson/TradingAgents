@@ -63,7 +63,7 @@ def get_ticker() -> str:
 
 
 def normalize_ticker_symbol(ticker: str) -> str:
-    """Resolve user input to its canonical Yahoo symbol (single source of truth).
+    """Resolve input according to the selected market data supplier.
 
     Delegates to the data layer's ``normalize_symbol`` so the symbol the CLI
     passes through the pipeline is exactly the one the data path will price
@@ -71,9 +71,9 @@ def normalize_ticker_symbol(ticker: str) -> str:
     plain upper-case if the data layer is unavailable.
     """
     try:
-        from tradingagents.dataflows.symbol_utils import normalize_symbol
+        from tradingagents.dataflows.symbol_utils import normalize_input_symbol
 
-        return normalize_symbol(ticker)
+        return normalize_input_symbol(ticker)
     except Exception:
         return ticker.strip().upper()
 

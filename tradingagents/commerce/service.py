@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
 import time
 from copy import deepcopy
+from functools import partial
 
 from tradingagents.application.runner import AnalysisRunner
 from tradingagents.application.task_manager import AnalysisTaskManager
@@ -37,8 +39,21 @@ class CommerceService:
         self.store = store
         self.creem = creem or CreemClient(settings)
         self.email = email or EmailClient(settings)
-        self.stock_validator = stock_validator
         self.base_config = deepcopy(DEFAULT_CONFIG if base_config is None else base_config)
+        if base_config is None:
+            # Storefront defaults are isolated from the local CLI/workbench.
+            # Explicit environment selections still override these defaults;
+            # an injected base_config is already the caller's chosen config.
+            for category, env_var, default in (
+                ("core_stock_apis", "TRADINGAGENTS_CORE_STOCK_VENDOR", "fmp"),
+                ("technical_indicators", "TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR", "local"),
+                ("instrument_data", "TRADINGAGENTS_INSTRUMENT_VENDOR", "fmp"),
+                ("fundamental_data", "TRADINGAGENTS_FUNDAMENTAL_VENDOR", "fmp"),
+                ("news_data", "TRADINGAGENTS_NEWS_VENDOR", "fmp"),
+            ):
+                self.base_config["data_vendors"][category] = os.getenv(env_var, "").strip() or default
+        self.stock_validator = (partial(validate_us_equity, config=self.base_config)
+                                if stock_validator is validate_us_equity else stock_validator)
 
     def create_checkout(self, ticker: str, language: str, idempotency_key: str, product_quote: str = "") -> dict:
         """先保存订单再创建收银台；相同请求重试时复用原订单。"""

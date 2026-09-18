@@ -38,7 +38,7 @@ def _dummy_api_keys(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_config():
+def _isolate_config(tmp_path):
     """Reset the global dataflows config before and after each test.
 
     ``set_config`` merges (it never clears keys absent from the override), so a
@@ -52,6 +52,9 @@ def _isolate_config():
     import tradingagents.default_config as default_config
 
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    config_module._config["data_cache_dir"] = str(tmp_path)
+    from tradingagents.dataflows import market_data
+    market_data._instrument_cache.clear()
     yield
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
 
@@ -65,3 +68,30 @@ def mock_llm_client():
         return_value=client,
     ):
         yield client
+
+
+@pytest.fixture()
+def fmp_http(monkeypatch):
+    """Run the real pinned SDK against a controlled HTTP boundary, never the network."""
+    import json
+    from types import SimpleNamespace
+
+    import requests
+
+    monkeypatch.setenv("FMP_API_KEY", "FMP-TEST-SECRET")
+    state = SimpleNamespace(calls=[], respond=lambda endpoint, params: (200, []))
+
+    def respond(session, url, *, params, headers, timeout):
+        assert url.startswith("https://financialmodelingprep.com/stable/")
+        assert headers == {"apikey": "FMP-TEST-SECRET"}
+        assert "apikey" not in params and timeout == (5, 30)
+        endpoint = url.removeprefix("https://financialmodelingprep.com/stable/")
+        state.calls.append((endpoint, params))
+        status, body = state.respond(endpoint, params)
+        response = requests.Response()
+        response.status_code, response.url = status, url
+        response._content = json.dumps(body).encode()
+        return response
+
+    monkeypatch.setattr(requests.Session, "get", respond)
+    return state

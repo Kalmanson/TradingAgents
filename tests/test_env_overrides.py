@@ -127,3 +127,34 @@ def test_unknown_env_var_is_ignored(monkeypatch):
         TRADINGAGENTS_NONEXISTENT_KEY="oops",
     )
     assert "nonexistent_key" not in dc.DEFAULT_CONFIG
+
+
+def test_market_data_environment_overrides_do_not_change_news_or_fundamentals(monkeypatch):
+    dc = _reload_with_env(monkeypatch, TRADINGAGENTS_CORE_STOCK_VENDOR="marketstack",
+                          TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR="local",
+                          TRADINGAGENTS_INSTRUMENT_VENDOR="marketstack")
+    try:
+        assert dc.DEFAULT_CONFIG["data_vendors"]["core_stock_apis"] == "marketstack"
+        assert dc.DEFAULT_CONFIG["data_vendors"]["technical_indicators"] == "local"
+        assert dc.DEFAULT_CONFIG["data_vendors"]["instrument_data"] == "marketstack"
+        assert dc.DEFAULT_CONFIG["data_vendors"]["news_data"] == "yfinance"
+        assert dc.DEFAULT_CONFIG["data_vendors"]["fundamental_data"] == "yfinance"
+    finally:
+        _reload_with_env(monkeypatch)
+
+
+def test_fmp_environment_selectors_and_key_are_independent(monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "not-a-config-value")
+    dc = _reload_with_env(monkeypatch, TRADINGAGENTS_CORE_STOCK_VENDOR="fmp",
+                          TRADINGAGENTS_INSTRUMENT_VENDOR="fmp",
+                          TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR="local",
+                          TRADINGAGENTS_FUNDAMENTAL_VENDOR=" fmp ", TRADINGAGENTS_NEWS_VENDOR="fmp")
+    try:
+        assert all(dc.DEFAULT_CONFIG["data_vendors"][key] == "fmp" for key in
+                   ("core_stock_apis", "instrument_data", "fundamental_data", "news_data"))
+        assert dc.DEFAULT_CONFIG["data_vendors"]["technical_indicators"] == "local"
+        assert "not-a-config-value" not in repr(dc.DEFAULT_CONFIG)
+    finally:
+        dc = _reload_with_env(monkeypatch)
+    assert all(dc.DEFAULT_CONFIG["data_vendors"][key] == "yfinance" for key in
+               ("core_stock_apis", "instrument_data", "technical_indicators", "fundamental_data", "news_data"))

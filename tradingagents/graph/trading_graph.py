@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import yfinance as yf
 from langgraph.prebuilt import ToolNode
 
 # Import the abstract tool methods from agent_utils
@@ -284,18 +283,15 @@ class TradingAgentsGraph:
         the full holding window has not traded (#1169), or the symbol is delisted
         or unreachable.
         """
-        from tradingagents.dataflows.symbol_utils import normalize_symbol
+        from tradingagents.dataflows.market_data import get_ohlcv
 
         try:
             start = datetime.strptime(trade_date, "%Y-%m-%d")
             end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
             end_str = end.strftime("%Y-%m-%d")
 
-            # Normalize so the realized-return lookup hits the same instrument
-            # the analysis priced (e.g. XAUUSD -> GC=F) (#984). The benchmark is
-            # already a canonical Yahoo symbol from ``_resolve_benchmark``.
-            stock = yf.Ticker(normalize_symbol(ticker)).history(start=trade_date, end=end_str)
-            bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
+            stock = get_ohlcv(ticker, trade_date, end_str, config=self.config)
+            bench = get_ohlcv(benchmark, trade_date, end_str, config=self.config)
 
             # Require the full holding window in both series. A rerun before it
             # has traded leaves the entry pending to retry next run, rather than
@@ -314,12 +310,12 @@ class TradingAgentsGraph:
             alpha = raw - bench_ret
             # The date of the last price bar used is when this outcome became
             # known — the point-in-time cutoff for injecting the lesson (#1251).
-            resolution_date = stock.index[holding_days].strftime("%Y-%m-%d")
+            resolution_date = max(stock["Date"].iloc[holding_days], bench["Date"].iloc[holding_days]).strftime("%Y-%m-%d")
             return raw, alpha, holding_days, resolution_date
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",
-                ticker, trade_date, benchmark, e,
+                ticker, trade_date, benchmark, type(e).__name__,
             )
             return None, None, None, None
 
@@ -399,6 +395,8 @@ class TradingAgentsGraph:
             f"debate={self.config['max_debate_rounds']}",
             f"risk={self.config['max_risk_discuss_rounds']}",
             f"asset={asset_type}",
+            "vendors=" + json.dumps(self.config.get("data_vendors", {}), sort_keys=True),
+            "tools=" + json.dumps(self.config.get("tool_vendors", {}), sort_keys=True),
         ])
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):

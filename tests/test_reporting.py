@@ -996,15 +996,18 @@ def test_market_data_logs_eligibility_and_errors_before_order_creation(commerce,
     output = "\n".join(records)
     trace = response.headers["X-Request-ID"]
     assert f"event=market_data_request trace_id={trace}" in output and '"ticker":"SPCX"' in output
-    assert '"operation":"Ticker.get_info"' in output and '"elapsed_ms":' in output
-    if kind in {"timeout", "rate_limit"}:
+    assert '"operation":"get_instrument_info"' in output and '"elapsed_ms":' in output
+    if kind in {"timeout", "rate_limit", "invalid_response"}:
         assert f"event=market_data_request_failed trace_id={trace}" in output
-        assert '"error_code":28' in output if kind == "timeout" else '"http_status":429' in output
+        if kind == "timeout":
+            assert '"error_code":28' in output
+        elif kind == "rate_limit":
+            assert '"http_status":429' in output
         assert response.json()["detail"] == "Market data is temporarily unavailable."
     else:
         assert f"event=market_data_response trace_id={trace}" in output
     if kind == "equity":
-        assert '"eligible":true' in output and '"quoteType":"EQUITY"' in output and '"exchange":"NMS"' in output
+        assert '"eligible":true' in output and '"quote_type":"EQUITY"' in output and '"exchange":"NMS"' in output
     else:
         assert not c.transport.checkouts
         assert c.store.get_order("market-data-query-test-12345", by="idempotency_key") is None
@@ -1608,3 +1611,220 @@ def test_captcha_request_size_boundaries(protected_storefront):
     accepted = c.client.post("/api/orders", json={"ticker": "AAPL", "recaptcha_token": "x" * 4096},
                              headers={"Idempotency-Key": "a" * 32})
     assert accepted.status_code == 200
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("explicit_config", [False, True])
+@pytest.mark.parametrize("ticker,kind", [("AAPL", "equity"), ("GOLD", "equity"), ("SPY", "etf"), ("AAPL", None)])
+def test_marketstack_checkout_and_paid_queue_keep_order_configuration(commerce, monkeypatch, ticker, kind, explicit_config):
+    import json
+    from copy import deepcopy
+    from unittest.mock import Mock
+
+    from tradingagents.commerce import service as service_module
+    from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.commerce.service import CommerceService
+    from tradingagents.dataflows import marketstack, yahoo
+    from tradingagents.dataflows.config import set_config
+
+    c = commerce
+    for env_var in ("TRADINGAGENTS_CORE_STOCK_VENDOR", "TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR",
+                    "TRADINGAGENTS_INSTRUMENT_VENDOR"):
+        monkeypatch.delenv(env_var, raising=False)
+    config = deepcopy(c.service.base_config)
+    config["data_vendors"].update({"core_stock_apis": "marketstack", "technical_indicators": "local",
+                                   "instrument_data": "marketstack"})
+    if not explicit_config:
+        monkeypatch.setenv("TRADINGAGENTS_CORE_STOCK_VENDOR", "marketstack")
+        monkeypatch.setenv("TRADINGAGENTS_INSTRUMENT_VENDOR", "marketstack")
+    set_config({"data_vendors": {"core_stock_apis": "yfinance", "instrument_data": "yfinance"}})
+    service = CommerceService(c.settings, c.store, creem=c.service.creem, email=c.service.email,
+                              base_config=config if explicit_config else None)
+    monkeypatch.setenv("MARKETSTACK_API_KEY", "purchase-secret-key")
+    monkeypatch.setattr(yahoo.yf, "Ticker", Mock(side_effect=AssertionError("Unexpected Yahoo request")))
+    monkeypatch.setattr(marketstack.requests, "get", lambda *a, **kw: SimpleNamespace(
+        status_code=200, headers={}, json=lambda: {
+            "symbol": ticker, "name": "Company", "item_type": kind,
+            "stock_exchange": {"mic": "XNAS", "country_code": "USA"},
+        },
+    ))
+    key = "marketstack-checkout-configuration-12345"
+    if kind != "equity":
+        with pytest.raises(ProviderUnavailable if kind is None else ValueError):
+            service.create_checkout(ticker, "en", key)
+        assert not c.transport.checkouts
+        assert c.store.get_order(key, by="idempotency_key") is None
+    else:
+        order = service.create_checkout(ticker, "en", key)
+        profile = json.loads(order["params_json"])
+        assert profile["config"]["data_vendors"]["core_stock_apis"] == "marketstack"
+        assert "purchase-secret-key" not in order["params_json"]
+        event = c.event(order)
+        assert service.process_webhook(event, json.dumps(event).encode()) == "PROCESSED"
+        run = c.store.tasks.list_runs()[0]
+        assert run["ticker"] == ticker  # GOLD must not become GC=F while enqueuing.
+        assert json.loads(run["request_json"])["ticker"] == ticker
+        runner = Mock()
+        monkeypatch.setattr(service_module, "AnalysisRunner", runner)
+        service.runner_factory(AnalysisRequest.from_dict(json.loads(run["request_json"])),
+                               artifact_dir=c.settings.data_dir / run["id"] / "artifacts")
+        assert runner.call_args.kwargs["config"]["data_vendors"] == profile["config"]["data_vendors"]
+    yahoo.yf.Ticker.assert_not_called()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("override", [None, "", "   ", " yfinance ", "marketstack,alpha_vantage"])
+def test_storefront_vendor_defaults_and_environment_do_not_mutate_local_config(commerce, monkeypatch, override):
+    from copy import deepcopy
+
+    from tradingagents.commerce import service as service_module
+    from tradingagents.dataflows.config import get_config
+    from tradingagents.mvp.app import create_app
+
+    expected = {"core_stock_apis": "fmp", "technical_indicators": "local",
+                "instrument_data": "fmp", "fundamental_data": "fmp", "news_data": "fmp"}
+    for env_var in ("TRADINGAGENTS_CORE_STOCK_VENDOR", "TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR",
+                    "TRADINGAGENTS_INSTRUMENT_VENDOR", "TRADINGAGENTS_FUNDAMENTAL_VENDOR",
+                    "TRADINGAGENTS_NEWS_VENDOR"):
+        monkeypatch.delenv(env_var, raising=False)
+    if override is not None:
+        monkeypatch.setenv("TRADINGAGENTS_CORE_STOCK_VENDOR", override)
+        expected["core_stock_apis"] = override.strip() or "fmp"
+    original = deepcopy(service_module.DEFAULT_CONFIG)
+    local = _request().build_config()
+    global_data = get_config()
+    app = create_app(commerce.settings, start_workers=False)
+    service = app.state.service
+    for category, provider in expected.items():
+        assert service.base_config["data_vendors"][category] == provider
+        assert local["data_vendors"][category] == "yfinance"
+    for category in ("macro_data", "prediction_markets"):
+        assert service.base_config["data_vendors"][category] == original["data_vendors"][category]
+    service.base_config["data_vendors"]["news_data"] = "changed"
+    service.base_config["tool_vendors"]["get_stock_data"] = "changed"
+    assert original == service_module.DEFAULT_CONFIG
+    assert _request().build_config() == local
+    assert get_config() == global_data
+
+
+@pytest.mark.integration
+def test_storefront_vendor_environment_overrides_and_explicit_config_take_precedence(commerce, monkeypatch):
+    from copy import deepcopy
+
+    from tradingagents.commerce.service import CommerceService
+
+    for env_var in ("TRADINGAGENTS_CORE_STOCK_VENDOR", "TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR",
+                    "TRADINGAGENTS_INSTRUMENT_VENDOR", "TRADINGAGENTS_FUNDAMENTAL_VENDOR",
+                    "TRADINGAGENTS_NEWS_VENDOR"):
+        monkeypatch.setenv(env_var, "yfinance")
+    service = CommerceService(commerce.settings, commerce.store)
+    for category in ("core_stock_apis", "technical_indicators", "instrument_data", "fundamental_data", "news_data"):
+        assert service.base_config["data_vendors"][category] == "yfinance"
+    config = deepcopy(service.base_config)
+    config["data_vendors"].update({"core_stock_apis": "marketstack", "technical_indicators": "local",
+                                   "instrument_data": "marketstack"})
+    config["tool_vendors"]["get_stock_data"] = "alpha_vantage"
+    explicit = CommerceService(commerce.settings, commerce.store, base_config=config)
+    assert explicit.base_config == config
+    explicit.base_config["data_vendors"]["core_stock_apis"] = "changed"
+    explicit.base_config["tool_vendors"]["get_stock_data"] = "changed"
+    assert config["data_vendors"]["core_stock_apis"] == "marketstack"
+    assert config["tool_vendors"]["get_stock_data"] == "alpha_vantage"
+
+
+@pytest.mark.integration
+def test_storefront_default_without_marketstack_key_blocks_checkout_without_yahoo(commerce, monkeypatch):
+    from unittest.mock import Mock
+
+    from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.commerce.service import CommerceService
+    from tradingagents.dataflows import marketstack, yahoo
+
+    for env_var in ("TRADINGAGENTS_CORE_STOCK_VENDOR", "TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR",
+                    "TRADINGAGENTS_INSTRUMENT_VENDOR", "MARKETSTACK_API_KEY"):
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setenv("TRADINGAGENTS_INSTRUMENT_VENDOR", "marketstack")
+    monkeypatch.setattr(yahoo.yf, "Ticker", Mock(side_effect=AssertionError("Unexpected Yahoo request")))
+    monkeypatch.setattr(marketstack.requests, "get", Mock(side_effect=AssertionError("Unexpected HTTP request")))
+    service = CommerceService(commerce.settings, commerce.store, creem=commerce.service.creem,
+                              email=commerce.service.email)
+    key = "missing-marketstack-key-123456789"
+    with pytest.raises(ProviderUnavailable):
+        service.create_checkout("AAPL", "en", key)
+    assert commerce.store.get_order(key, by="idempotency_key") is None
+    assert not commerce.transport.checkouts
+    yahoo.yf.Ticker.assert_not_called()
+    marketstack.requests.get.assert_not_called()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("symbol,kind", [("AAPL", "equity"), ("BRK.B", "equity"),
+                                        ("SPY", "etf"), ("INVALID", "empty"), ("MSFT", "unknown")])
+def test_fmp_checkout_snapshot_and_paid_queue(commerce, monkeypatch, fmp_http, symbol, kind):
+    import json
+    from unittest.mock import Mock
+
+    from tradingagents.commerce import service as service_module
+    from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.commerce.service import CommerceService
+    from tradingagents.dataflows import yahoo
+    from tradingagents.dataflows.config import set_config
+
+    for category in ("CORE_STOCK", "TECHNICAL_INDICATORS", "INSTRUMENT", "FUNDAMENTAL", "NEWS"):
+        monkeypatch.delenv(f"TRADINGAGENTS_{category}_VENDOR", raising=False)
+    set_config({"data_vendors": {"instrument_data": "yfinance"}})
+    yahoo_call = Mock(side_effect=AssertionError("Unexpected Yahoo"))
+    monkeypatch.setattr(yahoo.yf, "Ticker", yahoo_call)
+    fmp_http.respond = lambda endpoint, params: (200, [] if kind == "empty" else [{
+        "symbol": params["symbol"], "companyName": "Company", "exchange": "NYSE",
+        "isEtf": True if kind == "etf" else (None if kind == "unknown" else False),
+        "isFund": False, "isActivelyTrading": True,
+    }])
+    c = commerce
+    service = CommerceService(c.settings, c.store, creem=c.service.creem, email=c.service.email)
+    key = "fmp-checkout-configuration-1234567"
+    if kind != "equity":
+        with pytest.raises((ProviderUnavailable, ValueError)):
+            service.create_checkout(symbol, "en", key)
+        assert c.store.get_order(key, by="idempotency_key") is None and not c.transport.checkouts
+    else:
+        order = service.create_checkout(symbol, "en", key)
+        profile = json.loads(order["params_json"])
+        vendors = profile["config"]["data_vendors"]
+        assert all(vendors[key] == "fmp" for key in ("core_stock_apis", "instrument_data", "fundamental_data", "news_data"))
+        assert vendors["technical_indicators"] == "local"
+        assert "FMP-TEST-SECRET" not in order["params_json"] and "FMP_API_KEY" not in order["params_json"]
+        # Changing deployment configuration after checkout must not rewrite the
+        # purchased request when payment arrives or when its runner is built.
+        service.base_config["data_vendors"] = dict.fromkeys(vendors, "yfinance")
+        event = c.event(order)
+        assert service.process_webhook(event, json.dumps(event).encode()) == "PROCESSED"
+        run = c.store.tasks.list_runs()[0]
+        runner = Mock()
+        monkeypatch.setattr(service_module, "AnalysisRunner", runner)
+        service.runner_factory(AnalysisRequest.from_dict(json.loads(run["request_json"])),
+                               artifact_dir=c.settings.data_dir / run["id"] / "artifacts")
+        assert runner.call_args.kwargs["config"]["data_vendors"] == vendors
+    yahoo_call.assert_not_called()
+
+
+@pytest.mark.integration
+def test_fmp_default_missing_key_blocks_checkout_before_http(commerce, monkeypatch, fmp_http):
+    from unittest.mock import Mock
+
+    from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.commerce.service import CommerceService
+    from tradingagents.dataflows import yahoo
+
+    for name in ("FMP_API_KEY", "TRADINGAGENTS_INSTRUMENT_VENDOR"):
+        monkeypatch.delenv(name, raising=False)
+    yahoo_call = Mock(side_effect=AssertionError("Unexpected Yahoo"))
+    monkeypatch.setattr(yahoo.yf, "Ticker", yahoo_call)
+    service = CommerceService(commerce.settings, commerce.store, creem=commerce.service.creem,
+                              email=commerce.service.email)
+    key = "missing-fmp-key-1234567890123456"
+    with pytest.raises(ProviderUnavailable):
+        service.create_checkout("AAPL", "en", key)
+    assert not fmp_http.calls and not commerce.transport.checkouts
+    assert commerce.store.get_order(key, by="idempotency_key") is None
+    yahoo_call.assert_not_called()

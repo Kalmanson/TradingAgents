@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 
 import tradingagents.dataflows.stockstats_utils as su
+from tradingagents.dataflows import market_data
 
 TODAY = pd.Timestamp("2026-07-18")
 STALE = su.OHLCV_CACHE_TTL_SECONDS + 60
@@ -69,8 +70,8 @@ def test_load_ohlcv_refetches_stale_same_day_cache(tmp_path, monkeypatch):
 
     # Pre-seed the cache file load_ohlcv will look for, aged past the TTL.
     start = (TODAY - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
-    end = (TODAY + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    cache_file = tmp_path / f"AAPL-YFin-data-{start}-{end}.csv"
+    end = TODAY.strftime("%Y-%m-%d")
+    cache_file = tmp_path / f"ohlcv-v1-yfinance-AAPL-adjusted-rawvolume-{start}_{end}.csv"
     pd.DataFrame({"Date": ["2026-07-17"], "Close": [100.0]}).to_csv(cache_file, index=False)
     old = time.time() - STALE
     os.utime(cache_file, (old, old))
@@ -81,9 +82,9 @@ def test_load_ohlcv_refetches_stale_same_day_cache(tmp_path, monkeypatch):
         calls.append(1)
         return pd.DataFrame(
             {"Date": pd.to_datetime(["2026-07-17", "2026-07-18"]), "Close": [100.0, 222.0]}
-        ).set_index("Date")
+        )
 
-    monkeypatch.setattr(su.yf, "download", _fake_download)
+    monkeypatch.setitem(market_data.OHLCV_ADAPTERS, "yfinance", _fake_download)
 
     out = su.load_ohlcv("AAPL", TODAY.strftime("%Y-%m-%d"))
 
@@ -98,12 +99,12 @@ def test_load_ohlcv_reuses_fresh_same_day_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(su.pd.Timestamp, "today", staticmethod(lambda: TODAY))
 
     start = (TODAY - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
-    end = (TODAY + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    cache_file = tmp_path / f"AAPL-YFin-data-{start}-{end}.csv"
+    end = TODAY.strftime("%Y-%m-%d")
+    cache_file = tmp_path / f"ohlcv-v1-yfinance-AAPL-adjusted-rawvolume-{start}_{end}.csv"
     pd.DataFrame({"Date": ["2026-07-18"], "Close": [100.0]}).to_csv(cache_file, index=False)
 
     def _fail_download(*a, **k):
         raise AssertionError("fresh cache must not refetch")
 
-    monkeypatch.setattr(su.yf, "download", _fail_download)
+    monkeypatch.setitem(market_data.OHLCV_ADAPTERS, "yfinance", _fail_download)
     su.load_ohlcv("AAPL", TODAY.strftime("%Y-%m-%d"))

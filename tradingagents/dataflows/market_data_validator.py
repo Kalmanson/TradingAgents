@@ -91,6 +91,8 @@ def build_verified_market_snapshot(
         "",
         f"- Requested analysis date: {curr_date}",
         f"- Latest trading row used: {latest_date}",
+        f"- Provider: {df.attrs.get('provider', 'unknown')}",
+        f"- Price basis: {df.attrs.get('price_basis', 'adjusted_ohlc_raw_volume')} (daily, not real-time)",
         "- Rows after the requested analysis date are excluded before verification.",
         "",
         "### Latest verified OHLCV row",

@@ -1,5 +1,7 @@
 import logging
+from functools import partial
 
+from . import fmp, indicators, market_data
 from .alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -9,7 +11,6 @@ from .alpha_vantage import (
     get_indicator as get_alpha_vantage_indicator,
     get_insider_transactions as get_alpha_vantage_insider_transactions,
     get_news as get_alpha_vantage_news,
-    get_stock as get_alpha_vantage_stock,
 )
 from .config import get_config
 from .errors import (
@@ -34,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
+    "instrument_data": {
+        "description": "Instrument identity and listing metadata",
+        "tools": ["get_instrument_info"],
+    },
     "core_stock_apis": {
         "description": "OHLCV stock price data",
         "tools": [
@@ -78,6 +83,9 @@ TOOLS_CATEGORIES = {
 }
 
 VENDOR_LIST = [
+    "fmp",
+    "marketstack",
+    "local",
     "yfinance",
     "fred",
     "polymarket",
@@ -95,41 +103,51 @@ OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets"}
 VENDOR_METHODS = {
     # core_stock_apis
     "get_stock_data": {
-        "alpha_vantage": get_alpha_vantage_stock,
+        "alpha_vantage": partial(market_data.get_stock_data, vendor="alpha_vantage"),
         "yfinance": get_YFin_data_online,
+        "marketstack": partial(market_data.get_stock_data, vendor="marketstack"),
+        "fmp": partial(market_data.get_stock_data, vendor="fmp"),
     },
     # technical_indicators
     "get_indicators": {
         "alpha_vantage": get_alpha_vantage_indicator,
         "yfinance": get_stock_stats_indicators_window,
+        "local": indicators.get_stock_stats_indicators_window,
     },
     # fundamental_data
     "get_fundamentals": {
+        "fmp": fmp.get_fundamentals,
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
     },
     "get_balance_sheet": {
+        "fmp": fmp.get_balance_sheet,
         "alpha_vantage": get_alpha_vantage_balance_sheet,
         "yfinance": get_yfinance_balance_sheet,
     },
     "get_cashflow": {
+        "fmp": fmp.get_cashflow,
         "alpha_vantage": get_alpha_vantage_cashflow,
         "yfinance": get_yfinance_cashflow,
     },
     "get_income_statement": {
+        "fmp": fmp.get_income_statement,
         "alpha_vantage": get_alpha_vantage_income_statement,
         "yfinance": get_yfinance_income_statement,
     },
     # news_data
     "get_news": {
+        "fmp": fmp.get_news,
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
     },
     "get_global_news": {
+        "fmp": fmp.get_global_news,
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
     },
     "get_insider_transactions": {
+        "fmp": fmp.get_insider_transactions,
         "alpha_vantage": get_alpha_vantage_insider_transactions,
         "yfinance": get_yfinance_insider_transactions,
     },
@@ -150,11 +168,11 @@ def get_category_for_method(method: str) -> str:
             return category
     raise ValueError(f"Method '{method}' not found in any category")
 
-def get_vendor(category: str, method: str = None) -> str:
+def get_vendor(category: str, method: str = None, *, config: dict | None = None) -> str:
     """Get the configured vendor for a data category or specific tool method.
     Tool-level configuration takes precedence over category-level.
     """
-    config = get_config()
+    config = get_config() if config is None else config
 
     # Check tool-level configuration first (if method provided)
     if method:
@@ -200,8 +218,10 @@ def route_to_vendor(method: str, *args, **kwargs):
 
         try:
             return impl_func(*args, **kwargs)
-        except VendorRateLimitError:
+        except VendorRateLimitError as e:
             logger.warning("Vendor %r rate-limited for %s; trying next vendor.", vendor, method)
+            if first_error is None:
+                first_error = e
             continue
         except VendorNotConfiguredError as e:
             logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)

@@ -73,7 +73,7 @@ class StaleGuardPropagationTests(unittest.TestCase):
             def __init__(self, symbol):
                 pass
 
-            def history(self, start, end):
+            def history(self, start, end, **kwargs):
                 return stale
 
         with mock.patch.object(y_finance.yf, "Ticker", DummyTicker), \

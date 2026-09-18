@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from tradingagents.application.runner import ANALYST_ORDER, AnalysisRequest
 from tradingagents.commerce.config import LANGUAGES
 from tradingagents.commerce.observability import log_event
-from tradingagents.dataflows.symbol_utils import normalize_symbol
+from tradingagents.dataflows.market_data import get_instrument_info
 
 logger = logging.getLogger(__name__)
 
@@ -23,25 +23,30 @@ def validate_inputs(ticker: str, language: str) -> str:
     if not re.fullmatch(r"[A-Z]{1,5}(?:[.-][A-Z]{1,2})?", ticker):
         raise ValueError("Enter a US stock ticker, such as RXRX or BRK-B.")
     ticker = ticker.replace(".", "-")
-    if normalize_symbol(ticker) != ticker:
-        raise ValueError("This ticker resolves to an unsupported instrument.")
     if language not in LANGUAGES:
         raise ValueError("Choose one of the available report languages.")
     return ticker
 
 
-def validate_us_equity(ticker: str) -> None:
+def validate_us_equity(ticker: str, *, config: dict | None = None) -> None:
     # Deliberately fail closed before charging: the graph's identity resolver
     # is fail-open and therefore cannot serve as a purchase eligibility check.
-    import yfinance as yf
-
     from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.dataflows.errors import NoMarketDataError
+    from tradingagents.dataflows.interface import get_vendor
 
     started = time.monotonic()
-    context = {"provider": "yahoo_finance", "operation": "Ticker.get_info", "ticker": ticker}
+    context = {"provider": get_vendor("instrument_data", "get_instrument_info", config=config),
+               "operation": "get_instrument_info", "ticker": ticker}
     log_event(logger, "market_data_request", **context)
     try:
-        info = yf.Ticker(ticker).get_info() or {}
+        # Do not let an earlier research request's cached or fail-open identity
+        # authorize a purchase. Validate with this storefront's configuration.
+        info = get_instrument_info(ticker, config=config, refresh=True)
+    except NoMarketDataError:
+        log_event(logger, "market_data_response", level=logging.WARNING, **context,
+                  elapsed_ms=round((time.monotonic() - started) * 1000), result="unverifiable")
+        raise ProviderUnavailable("We could not verify this stock. Please try again later.") from None
     except Exception as exc:
         # yfinance/curl 异常原文可能包含 Cookie、crumb 或代理凭据，只记录结构化错误信息。
         response = getattr(exc, "response", None)
@@ -54,12 +59,18 @@ def validate_us_equity(ticker: str) -> None:
         log_event(logger, "market_data_response", level=logging.WARNING, **context, elapsed_ms=elapsed_ms,
                   result="unverifiable", body_format=type(info).__name__)
         raise ProviderUnavailable("We could not verify this stock. Please try again later.")
-    eligible = info.get("quoteType") == "EQUITY" and info.get("exchange") in {
-        "NMS", "NGM", "NCM", "NYQ", "ASE", "PCX", "BTS",
-    }
+    if not info.get("quote_type") or not info.get("exchange"):
+        raise ProviderUnavailable("We could not verify this stock. Please try again later.")
+    eligible = (info.get("quote_type") == "EQUITY"
+                and info.get("country") in {"US", "USA"}
+                and info.get("exchange") in {
+                    "NMS", "NGM", "NCM", "NYQ", "ASE", "PCX", "BTS",
+                    "XNAS", "XNYS", "XASE", "ARCX", "BATS", "XNGS", "XNCM", "XNMS",
+                })
+    context["provider"] = info["provider"]
     log_event(logger, "market_data_response", level=logging.INFO if eligible else logging.WARNING,
               **context, elapsed_ms=elapsed_ms, eligible=eligible,
-              response={field: info.get(field) for field in ("symbol", "quoteType", "exchange")})
+              response={field: info.get(field) for field in ("symbol", "quote_type", "exchange", "country")})
     if not eligible:
         raise ValueError("The first release supports stocks listed on US exchanges.")
 

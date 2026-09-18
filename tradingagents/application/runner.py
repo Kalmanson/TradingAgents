@@ -53,11 +53,11 @@ CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._^=-]{1,32}$")
 
 
-def normalize_ticker(value: str) -> str:
+def normalize_ticker(value: str, config: dict | None = None) -> str:
     """Normalize a user ticker through the data layer's canonical resolver."""
-    from tradingagents.dataflows.symbol_utils import normalize_symbol
+    from tradingagents.dataflows.symbol_utils import normalize_input_symbol
 
-    return normalize_symbol(value.strip())
+    return normalize_input_symbol(value.strip(), config)
 
 
 def infer_asset_type(ticker: str) -> str:
@@ -112,9 +112,9 @@ class AnalysisRequest:
         if self.backend_url and not re.match(r"^https?://", self.backend_url):
             raise ValueError("Backend URL 必须以 http:// 或 https:// 开头。")
 
-    def normalized(self) -> AnalysisRequest:
-        ticker = normalize_ticker(self.ticker)
-        asset_type = infer_asset_type(ticker)
+    def normalized(self, config: dict | None = None) -> AnalysisRequest:
+        ticker = normalize_ticker(self.ticker, config)
+        asset_type = "crypto" if ticker.upper().endswith(CRYPTO_SUFFIXES) else "stock"
         analysts = tuple(key for key in ANALYST_ORDER if key in self.analysts)
         if asset_type == "crypto":
             analysts = tuple(key for key in analysts if key != "fundamentals")
@@ -406,7 +406,7 @@ class AnalysisRunner:
         artifact_dir: str | Path | None = None,
         graph_factory: Callable[..., TradingAgentsGraph] = TradingAgentsGraph,
     ) -> None:
-        normalized = request.normalized()
+        normalized = request.normalized(DEFAULT_CONFIG if config is None else config)
         normalized.validate()
         self.request = normalized
         self.config = normalized.build_config(config)

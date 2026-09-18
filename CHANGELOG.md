@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [Unreleased]
+
+### Added
+
+- FMP stable API adapters through pinned `fmpsdk==20260824.0`: adjusted daily
+  prices with raw volume, instrument identity, fundamentals, financial statements,
+  stock/global news and insider transactions. Bounded retries sanitize SDK errors
+  and distinguish quota exhaustion from transient throttling.
+- `FMP_API_KEY`, `TRADINGAGENTS_FUNDAMENTAL_VENDOR` and `TRADINGAGENTS_NEWS_VENDOR`.
+  FMP statements filter disclosure dates; current overview snapshots are not
+  returned for historical runs. News is paginated, filtered and deduplicated.
+- Optional Marketstack V2 daily US equity/ETF prices and instrument metadata,
+  with environment-based vendor selection, pagination, adjusted OHLC/raw
+  volume, bounded retries and provider-isolated caches.
+- Shared structured price and instrument adapters, plus `local` stockstats
+  indicators using the configured price source. Existing Alpha Vantage and
+  Yahoo options remain available; fallback uses only the configured vendor chain.
+
+### Changed
+
+- The paid storefront defaults to FMP prices, identity, fundamentals, statements,
+  news and insider data, with local indicators. Local CLI/Web defaults remain Yahoo. Explicit environment or
+  injected configurations override these defaults without mutating the shared
+  configuration; a missing FMP key blocks purchase verification.
+- Price verification, realized returns, company identity and purchase eligibility
+  use the shared adapters. Checkout uses the storefront configuration and fails
+  closed for unknown instruments or ETFs; order snapshots carry vendor choices
+  through payment and task creation without storing API keys.
+- Checkpoint signatures include vendor configuration. News and fundamentals
+  retain independent routing; this migration does not establish commercial
+  licensing for all report data. Deployment, architecture and rollout guidance
+  now cover FMP defaults, Marketstack alternatives, diagnostics, live validation
+  and rollback. Commercial display licensing remains separate from SDK licensing.
+
 ## [0.4.0] — 2026-08-31
 
 Look-ahead and point-in-time fixes across the data and memory layers, clearer

@@ -1,6 +1,10 @@
 from datetime import datetime
+from io import StringIO
+
+import pandas as pd
 
 from .alpha_vantage_common import _filter_csv_by_date_range, _make_api_request
+from .errors import NoMarketDataError
 
 
 def get_stock(
@@ -38,3 +42,21 @@ def get_stock(
     response = _make_api_request("TIME_SERIES_DAILY_ADJUSTED", params)
 
     return _filter_csv_by_date_range(response, start_date, end_date)
+
+
+def get_ohlcv(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Normalize Alpha Vantage daily adjusted CSV to the shared price basis."""
+    response = _make_api_request("TIME_SERIES_DAILY_ADJUSTED", {
+        "symbol": symbol, "outputsize": "full", "datatype": "csv",
+    })
+    data = pd.read_csv(StringIO(response))
+    required = {"timestamp", "open", "high", "low", "close", "adjusted_close", "volume"}
+    if data.empty or not required.issubset(data.columns):
+        raise NoMarketDataError(symbol, detail="Alpha Vantage returned no adjusted daily bars")
+    factor = pd.to_numeric(data["adjusted_close"], errors="coerce") / pd.to_numeric(data["close"], errors="coerce")
+    if factor.isna().any() or (factor <= 0).any():
+        raise NoMarketDataError(symbol, detail="Alpha Vantage adjustment factors are unavailable")
+    frame = pd.DataFrame({"Date": data["timestamp"], "Volume": data["volume"]})
+    for name in ("open", "high", "low", "close"):
+        frame[name.title()] = pd.to_numeric(data[name], errors="coerce") * factor
+    return frame

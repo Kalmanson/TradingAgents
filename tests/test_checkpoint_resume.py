@@ -216,3 +216,20 @@ class TestCheckpointSignature(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_supplier_change_invalidates_checkpoint_signature():
+    from types import SimpleNamespace
+
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    graph = SimpleNamespace(selected_analysts=["market"], config={
+        "max_debate_rounds": 1, "max_risk_discuss_rounds": 1,
+        "data_vendors": {"core_stock_apis": "yfinance"},
+    })
+    old = TradingAgentsGraph._run_signature(graph, "stock")
+    graph.config["data_vendors"]["core_stock_apis"] = "marketstack"
+    new = TradingAgentsGraph._run_signature(graph, "stock")
+    assert old != new
+    graph.config["tool_vendors"] = {"get_stock_data": "yfinance"}
+    assert TradingAgentsGraph._run_signature(graph, "stock") != new

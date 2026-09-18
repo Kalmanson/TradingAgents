@@ -19,7 +19,7 @@ _PUBLIC_FIELDS = {
     "transaction", "mode", "status", "billing_type", "currency", "refund_currency", "tax_mode", "type",
     "eventType", "ticker", "language", "code", "error-codes", "error_type", "body_format", "method",
     "provider", "result", "failed_checks", "hostname", "expected_hostname", "content_type",
-    "operation", "symbol", "quoteType", "exchange",
+    "operation", "symbol", "quoteType", "quote_type", "exchange", "country",
 }
 
 
