@@ -119,10 +119,10 @@ pip install .
 
 ### Docker
 
-Alternatively, run with Docker:
+Alternatively, run with Docker (the CLI service uses the `cli` profile):
 ```bash
 cp .env.example .env  # add your API keys
-docker compose run --rm tradingagents
+docker compose --profile cli run --rm tradingagents
 ```
 
 For local models with Ollama:

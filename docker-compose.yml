@@ -36,6 +36,8 @@ services:
       - ./reports:/home/appuser/app/reports
     tty: true
     stdin_open: true
+    profiles:
+      - cli
 
   ollama:
     image: ollama/ollama:latest

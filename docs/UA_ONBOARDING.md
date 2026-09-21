@@ -175,7 +175,7 @@ config["data_vendors"]["core_stock_apis"] = "yfinance,alpha_vantage"
 
 ```bash
 cp .env.example .env
-docker compose run --rm tradingagents
+docker compose --profile cli run --rm tradingagents
 ```
 
 使用本地 Ollama：
@@ -184,8 +184,9 @@ docker compose run --rm tradingagents
 docker compose --profile ollama run --rm tradingagents-ollama
 ```
 
-当前工作区的容器启动方式有两个重要细节：
+当前工作区的容器启动方式有三个重要细节：
 
+- `docker-compose.yml` 中每个服务都声明了 profile（CLI 为 `cli`，Ollama 相关为 `ollama`，付费网站为 `mvp`）。`--profile` 只激活匹配的服务，不带 `--profile` 的 `up` 不会启动任何容器；`docker compose run` 指定服务名时会自动启用该服务自身的 profile。
 - `docker-entrypoint.sh` 先修复 `/home/appuser/.tradingagents` 持久化卷权限，再通过 `gosu` 降权为 `appuser` 执行 CLI。
 - Compose 将本地 `./reports` 绑定到容器的 `/home/appuser/app/reports`，便于直接取回报告。
 

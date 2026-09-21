@@ -54,9 +54,10 @@ def _request(endpoint: str, params: dict) -> dict:
             kind = error.get("type") or error.get("code")
             if not isinstance(kind, (str, int, type(None))):
                 raise VendorError("Marketstack returned an invalid error response")
-            # Monthly usage exhaustion is not a short-lived throttle.
-            if kind in {104, "104", "usage_limit_reached", "monthly_limit_reached"}:
-                raise VendorRateLimitError("Marketstack monthly request quota exhausted")
+            # Usage exhaustion (monthly or daily) is not a short-lived throttle.
+            if kind in {104, "104", "usage_limit_reached", "monthly_limit_reached",
+                        "daily_usage_limit_reached"}:
+                raise VendorRateLimitError("Marketstack request quota exhausted")
             if status in {401, 403} or kind in {
                 101, "101", 102, "102", 105, "105", "invalid_access_key",
                 "missing_access_key", "inactive_user", "function_access_restricted",
@@ -154,6 +155,8 @@ def get_instrument_info(symbol: str) -> dict:
         "symbol": canonical, "provider": "marketstack", "company_name": info.get("name"),
         "quote_type": str(info.get("item_type") or "").upper(),
         "exchange": exchange.get("mic"), "country": exchange.get("country_code"),
-        "currency": info.get("price_currency"), "sector": info.get("sector"),
+        # V2 TickerResponse 没有货币字段；price_currency 只出现在 EOD 数据行中。
+        # currency 无下游消费，保持 None 而不是读取 API 不会返回的字段。
+        "currency": None, "sector": info.get("sector"),
         "industry": info.get("industry"),
     }
