@@ -50,7 +50,22 @@ ANALYST_NODE_SPECS: dict[str, AnalystNodeSpec] = {
         tool_node="tools_fundamentals",
         report_key="fundamentals_report",
     ),
+    "industry": AnalystNodeSpec(
+        key="industry",
+        agent_node="Industry and Supply Chain Analyst",
+        clear_node="Msg Clear Industry",
+        tool_node="tools_industry",
+        report_key="industry_report",
+    ),
 }
+
+
+def applicable_analysts(selected_analysts: Iterable[str], asset_type: str) -> tuple[str, ...]:
+    """Keep explicit selections while removing roles unsupported by a resolved asset."""
+    excluded = {"industry"} if asset_type != "stock" else set()
+    if asset_type == "crypto":
+        excluded.add("fundamentals")
+    return tuple(key for key in selected_analysts if key not in excluded)
 
 
 def build_analyst_execution_plan(

@@ -18,22 +18,36 @@ def create_bear_researcher(llm):
         sentiment_report = state["sentiment_report"]
         news_report = state["news_report"]
         fundamentals_report = state["fundamentals_report"]
+        industry_report = state.get("industry_report", "")
+        industry_section = (
+            "Industry and supply chain evidence (retain catalysts, falsification conditions and evidence gaps):\n"
+            + industry_report + "\n" if industry_report else ""
+        )
         instrument_context = get_instrument_context_from_state(state)
         asset_type = state.get("asset_type", "stock")
-        target_label = "stock" if asset_type == "stock" else "asset"
+        target_label = {"stock": "stock", "etf": "ETF"}.get(asset_type, "asset")
         fundamentals_label = (
             "Company fundamentals report"
             if asset_type == "stock"
-            else "Asset fundamentals report (may be unavailable for crypto)"
+            else ("ETF fundamentals report" if asset_type == "etf"
+                  else "Asset fundamentals report (may be unavailable for crypto)")
+        )
+
+        instrument_focus = (
+            """- Fund risks: Assess exposure drawdowns, concentration, liquidity and adverse market conditions.
+- Fund costs: Consider reported fees and structure; do not invent tracking error or NAV discounts.
+- Negative evidence: Identify portfolio risks without treating missing corporate statements as a weakness of the ETF."""
+            if asset_type == "etf" else
+            """- Risks and Challenges: Highlight factors like market saturation, financial instability, or macroeconomic threats that could hinder the stock's performance.
+- Competitive Weaknesses: Emphasize vulnerabilities such as weaker market positioning, declining innovation, or threats from competitors.
+- Negative Indicators: Use evidence from financial data, market trends, or recent adverse news to support your position."""
         )
 
         prompt = f"""You are a Bear Analyst making the case against investing in the {target_label}. Your goal is to present a well-reasoned argument emphasizing risks, challenges, and negative indicators. Leverage the provided research and data to highlight potential downsides and counter bullish arguments effectively.
 
 Key points to focus on:
 
-- Risks and Challenges: Highlight factors like market saturation, financial instability, or macroeconomic threats that could hinder the stock's performance.
-- Competitive Weaknesses: Emphasize vulnerabilities such as weaker market positioning, declining innovation, or threats from competitors.
-- Negative Indicators: Use evidence from financial data, market trends, or recent adverse news to support your position.
+{instrument_focus}
 - Bull Counterpoints: Critically analyze the bull argument with specific data and sound reasoning, exposing weaknesses or over-optimistic assumptions.
 - Engagement: Present your argument in a conversational style, directly engaging with the bull analyst's points and debating effectively rather than simply listing facts.
 
@@ -44,7 +58,7 @@ Market research report: {market_research_report}
 Social media sentiment report: {sentiment_report}
 Latest world affairs news: {news_report}
 {fundamentals_label}: {fundamentals_report}
-Conversation history of the debate: {history}
+{industry_section}Conversation history of the debate: {history}
 Last bull argument: {current_response}
 Use this information to deliver a compelling bear argument, refute the bull's claims, and engage in a dynamic debate that demonstrates the risks and weaknesses of investing in the {target_label}.
 """ + get_language_instruction()

@@ -49,6 +49,12 @@ class ConditionalLogic:
             return "tools_fundamentals"
         return "Msg Clear Fundamentals"
 
+    def should_continue_industry(self, state: AgentState):
+        """Continue the bounded industry evidence loop or hand off the completed report."""
+        if getattr(state["messages"][-1], "tool_calls", []):
+            return "tools_industry"
+        return "Msg Clear Industry"
+
     def should_continue_debate(self, state: AgentState) -> str:
         """Determine if debate should continue."""
 

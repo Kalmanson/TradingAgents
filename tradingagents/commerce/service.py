@@ -11,7 +11,9 @@ import sqlite3
 import threading
 import time
 from copy import deepcopy
+from datetime import datetime
 from functools import partial
+from zoneinfo import ZoneInfo
 
 from tradingagents.application.runner import AnalysisRunner
 from tradingagents.application.task_manager import AnalysisTaskManager
@@ -25,9 +27,15 @@ from tradingagents.commerce.creem import (
 )
 from tradingagents.commerce.email import EmailClient
 from tradingagents.commerce.observability import log_event, trace_id
-from tradingagents.commerce.profile import build_profile, validate_inputs, validate_us_equity
+from tradingagents.commerce.profile import (
+    build_profile,
+    get_etf_allowlist,
+    validate_inputs,
+    validate_us_equity,
+)
 from tradingagents.commerce.store import CommerceStore
-from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.default_config import DEFAULT_CONFIG, _coerce
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +60,13 @@ class CommerceService:
                 ("news_data", "TRADINGAGENTS_NEWS_VENDOR", "fmp"),
             ):
                 self.base_config["data_vendors"][category] = os.getenv(env_var, "").strip() or default
+        if base_config is None and os.getenv("TRADINGAGENTS_ETF_ALLOWLIST", "").strip():
+            self.base_config["etf_allowlist"] = os.environ["TRADINGAGENTS_ETF_ALLOWLIST"].strip()
+        if base_config is None and os.getenv("TRADINGAGENTS_ETF_REPORTS_ENABLED", "").strip():
+            self.base_config["etf_reports_enabled"] = _coerce(os.environ["TRADINGAGENTS_ETF_REPORTS_ENABLED"], False)
+        if not isinstance(self.base_config.setdefault("etf_reports_enabled", False), bool):
+            raise ValueError("etf_reports_enabled must be a boolean")
+        get_etf_allowlist(self.base_config)  # Reject malformed lists at startup.
         self.stock_validator = (partial(validate_us_equity, config=self.base_config)
                                 if stock_validator is validate_us_equity else stock_validator)
 
@@ -77,8 +92,28 @@ class CommerceService:
         product = self.creem.get_product(refresh=True)
         if product_quote and product_quote != product["quote"]:
             raise PriceChanged("Product pricing changed. Reload this page and review the new price before continuing.")
-        self.stock_validator(ticker)
-        profile = build_profile(ticker, language, self.base_config)
+        # Legacy injected validators return None; the built-in validator returns
+        # the verified type. Persist it before payment and queue recovery.
+        asset_type = self.stock_validator(ticker) or "stock"
+        if asset_type == "etf":
+            if not self.base_config["etf_reports_enabled"]:
+                raise ValueError("ETF reports are currently disabled. Choose a US stock.")
+            # Profile access does not imply permission to fetch ETF holdings.
+            # Check the selected fund source before creating a payable order.
+            try:
+                fund_data = route_to_vendor(
+                    "get_etf_fundamentals", ticker,
+                    datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+                    config=self.base_config,
+                )
+                if (not isinstance(fund_data, str) or not fund_data.strip()
+                        or fund_data.startswith(("NO_DATA_AVAILABLE", "DATA_UNAVAILABLE"))):
+                    raise ProviderUnavailable("ETF fund data is unavailable")
+            except Exception as exc:
+                log_event(logger, "etf_data_preflight_failed", level=logging.WARNING,
+                          ticker=ticker, error_type=type(exc).__name__)
+                raise ProviderUnavailable("ETF fund data is temporarily unavailable. Please try again later.") from None
+        profile = build_profile(ticker, language, self.base_config, asset_type=asset_type)
         order, created = self.store.create_order(ticker, language, profile, idempotency_key, product)
         if not created:
             # 并发请求可能同时通过首次查询，数据库唯一约束决定谁负责创建收银台。

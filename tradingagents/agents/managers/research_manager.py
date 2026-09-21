@@ -19,6 +19,12 @@ def create_research_manager(llm):
 
     def research_manager_node(state) -> dict:
         instrument_context = get_instrument_context_from_state(state)
+        industry_report = state.get("industry_report", "")
+        industry_section = (
+            "Industry and supply chain report: preserve material catalysts, falsification conditions and "
+            "evidence gaps in the decision; do not turn an inference into a fact.\n"
+            + industry_report + "\n" if industry_report else ""
+        )
         history = state["investment_debate_state"].get("history", "")
 
         investment_debate_state = state["investment_debate_state"]
@@ -26,6 +32,7 @@ def create_research_manager(llm):
         prompt = f"""As the Research Manager and debate facilitator, your role is to critically evaluate this round of debate and deliver a clear, actionable investment plan for the trader.
 
 {instrument_context}
+{industry_section}
 
 ---
 

@@ -67,12 +67,14 @@ ANALYST_LABELS = {
     "social": "情绪分析师",
     "news": "新闻分析师",
     "fundamentals": "基本面分析师",
+    "industry": "行业与产业链分析师",
 }
 REPORT_LABELS = {
     "market_report": "市场分析",
     "sentiment_report": "市场情绪",
     "news_report": "新闻分析",
     "fundamentals_report": "基本面分析",
+    "industry_report": "行业与产业链分析",
     "investment_plan": "多空研究",
     "trader_investment_plan": "交易计划",
     "final_trade_decision": "风险与最终决策",
@@ -304,7 +306,8 @@ def render_new_analysis(manager: AnalysisTaskManager) -> None:
 
         analyst_options = ["market", "social", "news"]
         if asset_type != "crypto":
-            analyst_options.append("fundamentals")
+            analyst_options.extend(["fundamentals", "industry"])
+        st.caption("行业与产业链分析仅用于个股；运行时识别到 ETF 会自动跳过。")
         analysts = st.multiselect(
             "分析师团队",
             analyst_options,

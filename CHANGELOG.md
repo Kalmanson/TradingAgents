@@ -10,6 +10,38 @@ Breaking changes within the 0.x line are called out explicitly.
 
 ### Added
 
+- Default fifth stock analyst, `industry`, for industry cycles, supply-chain
+  transmission, bargaining power, company exposures and thesis falsification.
+  Its `industry_report` reaches research and risk teams, CLI/Web views and report
+  exports. ETFs/crypto skip this role; explicit saved analyst lists are preserved.
+- Combined SEC, FMP, FRED, official IR, Census, EIA and WSTS industry adapters,
+  with dated evidence, bounded HTML/PDF/XLSX parsing, historical exclusions,
+  isolated caches and at most three related issuers without recursive expansion.
+  SEC uses a declared User-Agent and one request per second per process.
+  Missing primary evidence yields an explicit insufficient-evidence report.
+  `scripts/check_industry_access.py` exercises the production adapters.
+- Industry output checks for truncation, unsupported quantitative conditions,
+  unprovided source URLs and WSTS unit conversion, with at most one revision.
+  Failed checks retain a deterministic evidence summary with issuer excerpts,
+  reported metrics, dates, locators, source links and specific validation reasons.
+  Rejected prose is excluded; a failed revision request also preserves evidence.
+  Industry checkpoint version v2 prevents resuming the previous empty fallback.
+  FMP diagnostics distinguish missing keys/dependencies, authentication failures,
+  subscription restrictions and access denials without exposing SDK payloads.
+- `TRADINGAGENTS_ETF_REPORTS_ENABLED` / `etf_reports_enabled`: paid ETF sales
+  default to disabled. Turning them off hides ETF purchase options and blocks new
+  ETF orders before fund-data preflight while preserving the allowlist, existing
+  orders, local analysis and benchmarks.
+- Optional paid reports for reviewed US equity ETFs: SPY, QQQ, VOO, IVV, VTI, DIA and IWM,
+  configurable via `TRADINGAGENTS_ETF_ALLOWLIST` (`none` disables new ETF sales).
+  ETF fund-data preflight blocks orders when permissions or data are unavailable.
+  Verified ETF mode persists through order snapshots and queue recovery. Local
+  analysis recognizes ETF metadata without changing its Yahoo defaults.
+- ETF fundamentals tool for FMP and Yahoo: strategy, fees, fund assets, holdings
+  and exposures with snapshot dates and missing-data limits. ETF analysts and
+  debates use fund-specific prompts, separate from corporate statements. Old
+  local checkpoints restart under the updated analysis version.
+
 - FMP stable API adapters through pinned `fmpsdk==20260824.0`: adjusted daily
   prices with raw volume, instrument identity, fundamentals, financial statements,
   stock/global news and insider transactions. Bounded retries sanitize SDK errors
@@ -32,7 +64,7 @@ Breaking changes within the 0.x line are called out explicitly.
   configuration; a missing FMP key blocks purchase verification.
 - Price verification, realized returns, company identity and purchase eligibility
   use the shared adapters. Checkout uses the storefront configuration and fails
-  closed for unknown instruments or ETFs; order snapshots carry vendor choices
+  closed for unknown instruments or ETFs outside the reviewed allowlist; order snapshots carry vendor choices
   through payment and task creation without storing API keys.
 - Checkpoint signatures include vendor configuration. News and fundamentals
   retain independent routing; this migration does not establish commercial

@@ -1,6 +1,6 @@
 # TradingAgents 学习与二次开发指南
 
-> 适用版本：`tradingagents 0.3.1`，代码基线 `a33fd4c`。本文依据当前工作区源码和 `.ua/knowledge-graph.json` 整理，包含当前尚未提交的 Docker 权限与报告目录挂载改动。
+> 适用版本：`tradingagents 0.3.1`。初稿依据 `a33fd4c` 源码和 `.ua/knowledge-graph.json` 整理；2026-09-21 按当前工作区补齐行业与产业链分析师的流程、配置和接入说明。既有图谱未为该新增角色重建，新增模块以源码为准。
 
 ## 1. 先认识项目
 
@@ -14,7 +14,7 @@ TradingAgents 是一个基于 LangGraph 的多智能体金融研究框架。它�
 - LangGraph 负责有状态工作流和条件路由。
 - LangChain 负责模型、消息、工具和 structured output 接口。
 - Typer + Rich 提供交互式 CLI。
-- Yahoo Finance、Alpha Vantage、FRED、Polymarket 等提供外部数据。
+- FMP、Yahoo Finance、Alpha Vantage、FRED、Polymarket 等提供外部数据；行业模块另组合 SEC、公司官网和 Census/EIA/WSTS 官方文件。
 - Pydantic schema 约束关键决策型 Agent 的输出。
 - SQLite checkpointer、Markdown memory log 和报告树负责不同层次的持久化。
 
@@ -22,10 +22,12 @@ TradingAgents 是一个基于 LangGraph 的多智能体金融研究框架。它�
 
 ```mermaid
 flowchart LR
-    A["CLI / Python API"] --> B["TradingAgentsGraph"]
+    A["CLI / 本地 Web / 付费入口 / Python API"] --> B["TradingAgentsGraph"]
     B --> C["分析师与工具循环"]
     C --> D["Market / Sentiment / News / Fundamentals"]
-    D --> E["Bull ↔ Bear 研究辩论"]
+    D --> IND["Industry：个股默认第五位"]
+    IND --> E["Bull ↔ Bear 研究辩论"]
+    D -.->|ETF / crypto 跳过行业| E
     E --> F["Research Manager"]
     F --> G["Trader"]
     G --> H["Aggressive / Conservative / Neutral 风险讨论"]
@@ -34,10 +36,15 @@ flowchart LR
 
     C --> K["Agent tools"]
     K --> L["dataflows.interface"]
-    L --> M["Yahoo / Alpha Vantage / FRED / Polymarket"]
+    L --> M["FMP / Yahoo / Alpha Vantage / FRED / Polymarket"]
+    C --> IT["绑定状态的行业工具"]
+    IT --> IE["dataflows.industry：组合来源、日期与预算约束"]
+    IE --> IS["SEC / FMP / FRED / 官网 / Census / EIA / WSTS"]
 ```
 
 分析师阶段按所选顺序串行执行。每个分析师都可能在“LLM 节点 → ToolNode → LLM 节点”之间循环，直到模型不再请求工具。研究辩论和风险讨论由条件路由控制轮次。
+
+新股票分析默认顺序为市场、情绪、新闻、基本面、行业与产业链；ETF 跳过行业，crypto 同时跳过基本面。标的身份确定后统一过滤有效角色集合，进度、执行和 checkpoint 使用同一集合。行业节点先强制取得上下文和指标证据，无核心披露时直接降级，不让模型自行补写。
 
 ## 2. 如何安装和运行
 
@@ -129,7 +136,7 @@ config["deep_think_llm"] = "gpt-5.5"
 config["output_language"] = "Chinese"
 
 graph = TradingAgentsGraph(
-    selected_analysts=("market", "social", "news", "fundamentals"),
+    selected_analysts=("market", "social", "news", "fundamentals", "industry"),
     debug=False,
     config=config,
 )
@@ -141,6 +148,8 @@ report_path = graph.save_reports(final_state, "NVDA")
 print(report_path)
 ```
 
+省略 `selected_analysts` 也会使用这五位。显式传入旧四角色列表会保持四角色，不自动追加；在 CLI/Web 中可取消行业角色。上述历史日期会排除无历史版本的当前行业文件。行业来源配置及 SEC 联系方式见[部署说明](付费报告部署与运行.md#35-行业与产业链分析配置)。
+
 调用加密资产时显式传入资产类型：
 
 ```python
@@ -151,7 +160,7 @@ final_state, decision = graph.propagate(
 )
 ```
 
-注意：`DEFAULT_CONFIG.copy()` 是浅拷贝，适合覆盖字符串、整数等顶层值。如果要修改 `data_vendors`、`tool_vendors` 或 `benchmark_map` 等嵌套字典，应使用深拷贝，避免意外修改共享默认值：
+注意：`DEFAULT_CONFIG.copy()` 是浅拷贝，适合覆盖字符串、整数等顶层值。如果要修改 `data_vendors`、`tool_vendors`、`benchmark_map` 等嵌套字典，或原地修改 `industry_sources` 列表，应使用深拷贝，避免意外修改共享默认值：
 
 ```python
 from copy import deepcopy
@@ -221,7 +230,7 @@ TradingAgents/
 │   │   ├── propagation.py          # 初始状态和调用参数
 │   │   └── checkpointer.py         # SQLite checkpoint
 │   ├── agents/                     # 角色实现和 Agent 共享契约
-│   │   ├── analysts/               # 技术、情绪、新闻、基本面分析
+│   │   ├── analysts/               # 技术、情绪、新闻、基本面、行业与产业链分析
 │   │   ├── researchers/            # Bull / Bear
 │   │   ├── managers/               # Research / Portfolio Manager
 │   │   ├── trader/                 # Trader
@@ -234,6 +243,7 @@ TradingAgents/
 │   │   ├── y_finance.py            # Yahoo Finance
 │   │   ├── alpha_vantage*.py       # Alpha Vantage 适配器族
 │   │   ├── fred.py                 # 宏观数据
+│   │   ├── industry/               # 行业披露、官方统计文件、传输与证据组合
 │   │   ├── polymarket.py           # 预测市场
 │   │   └── symbol_utils.py         # 跨市场标的规范化
 │   └── llm_clients/                # 多模型供应商适配
@@ -243,7 +253,7 @@ TradingAgents/
 │       ├── capabilities.py          # 模型能力声明
 │       └── model_catalog.py         # CLI 模型目录
 ├── tests/                           # 现有契约与回归测试
-├── scripts/                         # 结构化输出冒烟验证
+├── scripts/                         # 结构化输出、SEC/行业来源冒烟验证
 ├── Dockerfile
 ├── docker-compose.yml
 └── .github/workflows/ci.yml
@@ -281,6 +291,8 @@ TradingAgents/
 | `output_language` | 面向用户报告语言；内部辩论仍以英文为主 |
 | `data_vendors` | 各数据类别的 vendor 链 |
 | `tool_vendors` | 单个工具的 vendor 覆盖，优先级更高 |
+| `industry_sources` | 行业独立来源组合；默认 sec/fmp/fred/company_ir/census/eia/wsts，不是回退链 |
+| `industry_max_related_companies` | 本轮关联公司数量上限，整数 0–3；0 不展开关联公司 |
 
 优先级可以理解为：
 
@@ -297,11 +309,13 @@ config["data_vendors"]["news_data"] = "yfinance,alpha_vantage"
 
 代码不会偷偷追加未配置的 vendor；`default` 才表示使用该方法所有已注册实现。
 
+行业模块使用 `industry_sources` 独立组合，不能用原有 vendor 选择器关闭它的 FMP/SEC 等来源。这两个行业配置当前没有环境变量映射；`SEC_USER_AGENT`、`FMP_API_KEY`、`FRED_API_KEY` 则由运行环境提供。
+
 ### 4.2 AgentState 是工作流契约
 
 `tradingagents/agents/utils/agent_states.py` 定义了三组状态：
 
-- `AgentState`：标的、资产类型、日期、消息、四类分析报告、研究计划、交易方案和最终决策。
+- `AgentState`：标的、资产类型、日期、消息、五类分析报告（含 `industry_report`）、行业本轮 ID、研究计划、交易方案和最终决策。
 - `InvestDebateState`：Bull/Bear 历史、当前回答、Research Manager 裁决和轮次计数。
 - `RiskDebateState`：三种风险立场的历史、最近发言者、Portfolio Manager 裁决和轮次计数。
 
@@ -353,6 +367,16 @@ Research Manager、Trader、Portfolio Manager 和 Sentiment Analyst 使用 Pydan
 
 成功完成分析后，对应 checkpoint 会自动清除。交易记忆则先保存 pending 决策；同 ticker 后续运行时获取真实收益并补写反思。
 
+### 4.6 行业角色的证据与降级
+
+`industry_analyst.py` 与 `industry_data_tools.py` 展示了一种先取证据再生成报告的工具循环。`get_industry_context`、`get_industry_indicators` 是必需采集；`get_related_company_evidence` 按需取得最多三家公司的披露，只允许一层。工具通过 `InjectedState` 绑定主标的和日期，状态参数不暴露给模型；恢复时从工具消息恢复已使用的关联预算和来源拒绝状态。
+
+`dataflows/industry/` 中，`documents.py` 处理 SEC/官网披露和定位提取，`indicators.py` 处理明确的行业指标映射及 CSV/XLSX，`transport.py` 处理有界下载、缓存和 SEC 请求约束，`IndustryResearch` 组合证据与逐源失败。只启用 SEC 时也可按 SEC ticker/CIK 映射核验关联公司。不要把 FMP 同行候选或匿名客户自动变成已知供应链关系。
+
+历史分析按披露时间选择 SEC 申报，FRED 使用历史版本；当前 FMP 拆分、官网和官方统计文件没有历史可用性依据时直接排除。核心披露全缺时不调用模型，报告只说明证据不足；部分源失败保留其他证据。报告校验发现截断、无依据数字条件、未提供的引用 URL 或 WSTS 金额问题时最多修订一次，仍失败或修订请求报错则生成来源资料摘要：直接展示披露摘录、原始指标、日期、原文定位和来源链接，并明确具体失败原因，不采用被拒绝的模型草稿。这不是完整行业判断或全量事实核查。诊断进入 `industry_report_validation` 日志和节点消息元数据，行业检查点版本为 `v2`。
+
+行业报告直接传给多空研究员、三位风控分析师和研究/最终决策经理，输出到 `1_analysts/industry.md` 及完整报告。旧状态缺少该字段时按空值兼容。完整职责和五个问题见[架构说明](付费报告系统架构.md#33-行业与产业链分析)，公开数据探测与模型验收见[验证报告](行业分析数据源接入验证.md)。
+
 ## 5. 二次开发的推荐方式
 
 先遵守三条边界：
@@ -373,8 +397,10 @@ Research Manager、Trader、Portfolio Manager 和 Sentiment Analyst 使用 Pydan
 6. 在 `GraphSetup.setup_graph()` 的 `analyst_factories` 注册 factory。
 7. 在 `ConditionalLogic` 增加对应 `should_continue_<key>`，返回值必须与执行计划节点名一致。
 8. 在 `cli/models.py`、`cli/utils.py` 和 `cli/main.py` 更新可选项、固定顺序、状态展示与报告映射。
-9. 如果新的选择改变图形，确认 `TradingAgentsGraph._run_signature()` 能让旧 checkpoint 失效。
-10. 复用 `tests/test_analyst_execution.py`、`tests/test_risk_router_path_map.py`、`tests/test_i18n_coverage.py` 等现有测试验证契约。
+9. 同步 `application/runner.py` 的角色顺序、报告/进度映射，以及 `web/app.py`、`reporting.py` 的展示和输出；付费入口通过默认角色集合生成新订单，并在 `commerce/profile.py` 保存需要复现的非密钥配置。
+10. 明确资产适用范围，在身份确定后统一过滤，并在新节点/工具防御性检查；默认增加角色不能改写旧任务显式列表。
+11. 如果新的选择或配置改变执行语义，确认 `TradingAgentsGraph._run_signature()` 隔离不兼容 checkpoint；同时让旧状态缺字段时可读取。
+12. 明确下游消费者，按需要接入研究/风控/经理上下文；复用 `tests/test_analyst_execution.py`、`tests/test_reporting.py`、`tests/test_checkpoint_resume.py`、`tests/test_i18n_coverage.py` 等现有测试验证契约。
 
 最容易漏的是 CLI 展示映射和 checkpoint 图形签名，而不是 Agent prompt 本身。
 
@@ -441,6 +467,8 @@ Research Manager、Trader、Portfolio Manager 和 Sentiment Analyst 使用 Pydan
 | `tradingagents/graph/conditional_logic.py` | 改工具循环、辩论轮次或分支 |
 | `tradingagents/agents/schemas.py` | 改研究、交易、组合与情绪输出契约 |
 | `tradingagents/agents/utils/agent_utils.py` | 改 Agent 共用上下文、语言与工具入口 |
+| `tradingagents/agents/analysts/industry_analyst.py`、`tradingagents/agents/utils/industry_data_tools.py` | 行业职责、强制采集、输出校验、状态与关联预算 |
+| `tradingagents/dataflows/industry/` | SEC/官网提取、行业指标、官方文件解析、来源降级与缓存 |
 | `tradingagents/dataflows/interface.py` | 新增工具方法、vendor 或回退行为 |
 | `tradingagents/dataflows/config.py` | 理解嵌套 vendor 配置如何合并和隔离 |
 | `tradingagents/llm_clients/factory.py` | 新增原生 provider 或改变创建路径 |
@@ -508,7 +536,7 @@ pytest -q tests/test_memory_log.py tests/test_reporting.py
 2. `main.py` 与 `default_config.py`：跑通最小 Python 调用。
 3. `agent_states.py` 与 `propagation.py`：理解全图交换的数据。
 4. `trading_graph.py` 与 `setup.py`：看完整图如何初始化和连接。
-5. 四个 analyst：对比“读状态 → 组 prompt → 调工具 → 写报告”的共同模式。
+5. 五个 analyst：对比“读状态 → 组 prompt → 调工具 → 写报告”的共同模式；行业角色额外要求先取得核心披露，并限制关联研究范围。
 6. Bull/Bear、Research Manager、Trader、风险团队和 Portfolio Manager：理解决策如何逐级收敛。
 7. `schemas.py` 与 `structured.py`：理解关键 Agent 的稳定输出契约。
 8. `dataflows/interface.py` 和一个具体 vendor：理解数据路由边界。

@@ -35,12 +35,12 @@ def test_fmp_instrument_mapping_is_exact_and_purchase_safe(fmp_http, symbol, cha
     profile = {"symbol": symbol.replace(".", "-"), "companyName": "Company", "exchange": "NASDAQ",
                "isEtf": False, "isFund": False, "isActivelyTrading": True, **changes}
     fmp_http.respond = lambda endpoint, params: (200, [profile])
-    config = {"data_vendors": {"instrument_data": "fmp"}}
+    config = {"etf_reports_enabled": True, "data_vendors": {"instrument_data": "fmp"}}
     info = market_data.get_instrument_info(symbol, config=config)
     assert info["quote_type"] == kind and info["exchange"] == exchange
     assert info["country"] == ("US" if exchange else None)
-    if kind == "EQUITY":
-        validate_us_equity(symbol, config=config)
+    if kind in {"EQUITY", "ETF"}:
+        assert validate_us_equity(symbol, config=config) == ("etf" if kind == "ETF" else "stock")
     else:
         with pytest.raises((ValueError, ProviderUnavailable)):
             validate_us_equity(symbol, config=config)
@@ -221,7 +221,7 @@ if __name__ == "__main__":
     ("MSFT", "equity", "XNAS", "US", "ok"),
     ("BRK-B", "equity", "XNYS", "USA", "ok"),
     ("BRK.B", "equity", "XNYS", "USA", "ok"),
-    ("SPY", "etf", "ARCX", "USA", "unsupported"),
+    ("SPY", "etf", "ARCX", "USA", "ok"),
     ("AAPL", "equity", "XLON", "GBR", "unsupported"),
     ("AAPL", None, "XNAS", "USA", "unverifiable"),
     ("AAPL", "equity", None, "USA", "unverifiable"),
@@ -237,7 +237,7 @@ def test_marketstack_purchase_validation_uses_own_configuration(monkeypatch, tic
 
     # Global research defaults must not determine storefront eligibility.
     set_config({"data_vendors": {"instrument_data": "yfinance"}})
-    config = {"data_vendors": {"instrument_data": "marketstack"}}
+    config = {"etf_reports_enabled": True, "data_vendors": {"instrument_data": "marketstack"}}
     monkeypatch.setenv("MARKETSTACK_API_KEY", "key")
     monkeypatch.setattr(yahoo.yf, "Ticker", Mock(side_effect=AssertionError("Unexpected Yahoo")))
     requested = []
@@ -282,3 +282,50 @@ def test_identity_cache_is_provider_specific_and_does_not_hide_purchase_outage(m
     with pytest.raises(ProviderUnavailable):
         validate_us_equity("AAPL")  # refresh, even though research has a cached identity
     assert marketstack.call_count == 2
+
+
+@pytest.mark.parametrize("symbol", ["SPY", "QQQ", "VOO", "IVV", "VTI", "DIA", "IWM"])
+def test_reviewed_etfs_require_provider_confirmation(fmp_http, symbol):
+    from tradingagents.commerce.profile import validate_us_equity
+
+    fmp_http.respond = lambda endpoint, params: (200, [{
+        "symbol": symbol, "companyName": "Verified fund", "exchange": "NYSE ARCA",
+        "isEtf": True, "isFund": False, "isActivelyTrading": True,
+    }])
+    assert validate_us_equity(symbol, config={"etf_reports_enabled": True, "data_vendors": {"instrument_data": "fmp"}}) == "etf"
+
+
+@pytest.mark.parametrize("symbol,changes,allowlist", [
+    ("TQQQ", {}, "SPY,QQQ,VOO,IVV,VTI,DIA,IWM"),
+    ("SQQQ", {}, "SPY"), ("GLD", {}, "SPY"), ("BND", {}, "SPY"),
+    ("SPY", {}, "none"), ("SPY", {"isEtf": None}, "SPY"),
+    ("SPY", {"isActivelyTrading": False}, "SPY"),
+    ("SPY", {"isActivelyTrading": None}, "SPY"),
+    ("SPY", {"exchange": "LSE"}, "SPY"),
+    ("SPY", {"isEtf": False, "isFund": True}, "SPY"),
+])
+def test_etf_allowlist_never_bypasses_type_or_listing(fmp_http, symbol, changes, allowlist):
+    from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.commerce.profile import validate_us_equity
+
+    fmp_http.respond = lambda endpoint, params: (200, [{
+        "symbol": symbol, "companyName": "Verified fund", "exchange": "NYSE ARCA",
+        "isEtf": True, "isFund": False, "isActivelyTrading": True, **changes,
+    }])
+    with pytest.raises((ValueError, ProviderUnavailable)):
+        validate_us_equity(symbol, config={"etf_reports_enabled": True, "etf_allowlist": allowlist, "data_vendors": {"instrument_data": "fmp"}})
+
+
+def test_etf_identity_selects_fund_context_and_resets_between_runs(monkeypatch):
+    from tradingagents.graph import trading_graph
+
+    graph = object.__new__(trading_graph.TradingAgentsGraph)
+    monkeypatch.setattr(trading_graph, "resolve_instrument_identity", lambda ticker: {
+        "company_name": "Verified Fund", "quote_type": "ETF"} if ticker == "SPY" else {})
+    context = graph.resolve_instrument_context("SPY")
+    assert graph.resolved_asset_type == "etf" and "Fund: Verified Fund" in context
+    assert "operating company" in context and "not tracking error" in context
+    graph.resolve_instrument_context("AAPL")
+    assert graph.resolved_asset_type == "stock"
+    graph.resolve_instrument_context("QQQ", "etf")  # Purchased ETF survives identity outage.
+    assert graph.resolved_asset_type == "etf"

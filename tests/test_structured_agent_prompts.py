@@ -146,3 +146,23 @@ def test_constraint_text_is_unambiguous():
     # No template braces: it is embedded in ChatPromptTemplate strings, where
     # braces would be parsed as input variables.
     assert "{" not in NO_EXTERNAL_TOOLS and "}" not in NO_EXTERNAL_TOOLS
+
+
+def test_industry_evidence_reaches_research_and_risk_nodes():
+    from langchain_core.messages import AIMessage
+
+    from tradingagents.agents.researchers.bear_researcher import create_bear_researcher
+    from tradingagents.agents.researchers.bull_researcher import create_bull_researcher
+    from tradingagents.agents.risk_mgmt.aggressive_debator import create_aggressive_debator
+    from tradingagents.agents.risk_mgmt.conservative_debator import create_conservative_debator
+    from tradingagents.agents.risk_mgmt.neutral_debator import create_neutral_debator
+    from tradingagents.graph.propagation import Propagator
+
+    state = Propagator().create_initial_state("NVDA", "2026-09-20")
+    state.update(industry_report="INDUSTRY_CATALYST_MARKER", trader_investment_plan="plan")
+    for factory in (create_bull_researcher, create_bear_researcher, create_aggressive_debator,
+                    create_conservative_debator, create_neutral_debator):
+        llm = MagicMock()
+        llm.invoke.return_value = AIMessage(content="analysis")
+        factory(llm)(state)
+        assert "INDUSTRY_CATALYST_MARKER" in llm.invoke.call_args.args[0]

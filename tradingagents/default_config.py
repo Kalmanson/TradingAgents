@@ -13,6 +13,8 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_INSTRUMENT_VENDOR": "data_vendors.instrument_data",
     "TRADINGAGENTS_FUNDAMENTAL_VENDOR": "data_vendors.fundamental_data",
     "TRADINGAGENTS_NEWS_VENDOR": "data_vendors.news_data",
+    "TRADINGAGENTS_ETF_ALLOWLIST": "etf_allowlist",
+    "TRADINGAGENTS_ETF_REPORTS_ENABLED": "etf_reports_enabled",
     "TRADINGAGENTS_LLM_PROVIDER":         "llm_provider",
     "TRADINGAGENTS_DEEP_THINK_LLM":       "deep_think_llm",
     "TRADINGAGENTS_QUICK_THINK_LLM":      "quick_think_llm",
@@ -140,6 +142,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
         "ECB Bank of England BOJ central bank policy",
         "oil commodities supply chain energy",
     ],
+    # New paid ETF reports are opt-in. Keep the reviewed list while paused.
+    "etf_reports_enabled": False,
+    # Explicitly combined industry evidence sources; ordinary stocks only.
+    "industry_sources": ["sec", "fmp", "fred", "company_ir", "census", "eia", "wsts"],
+    "industry_max_related_companies": 3,
+    # A provider must still confirm ETF type and US listing when enabled.
+    "etf_allowlist": "SPY,QQQ,VOO,IVV,VTI,DIA,IWM",
     # Data vendor configuration
     # Category-level configuration (default for all tools in category).
     # The configured value is the exact vendor chain — requests are NOT silently

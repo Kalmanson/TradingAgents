@@ -15,6 +15,7 @@ from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_balance_sheet,
     get_cashflow,
+    get_etf_fundamentals,
     get_fundamentals,
     get_global_news,
     get_income_statement,
@@ -27,6 +28,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_verified_market_snapshot,
     resolve_instrument_identity,
 )
+from tradingagents.agents.utils.industry_data_tools import build_industry_tools
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.utils import safe_ticker_component
@@ -34,6 +36,7 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.reporting import write_report_tree
 
+from .analyst_execution import applicable_analysts
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
 from .propagation import Propagator
@@ -80,7 +83,7 @@ class TradingAgentsGraph:
 
     def __init__(
         self,
-        selected_analysts=("market", "social", "news", "fundamentals"),
+        selected_analysts=("market", "social", "news", "fundamentals", "industry"),
         debug=False,
         config: dict[str, Any] = None,
         callbacks: list | None = None,
@@ -156,7 +159,8 @@ class TradingAgentsGraph:
         self.log_states_dict = {}  # date to full state dict
 
         # Graph-shape-affecting run choices, kept for the checkpoint signature.
-        self.selected_analysts = tuple(selected_analysts)
+        self.requested_analysts = tuple(selected_analysts)
+        self.selected_analysts = self.requested_analysts
 
         # Set up the graph: keep the workflow for recompilation with a checkpointer.
         self.workflow = self.graph_setup.setup_graph(selected_analysts)
@@ -209,6 +213,7 @@ class TradingAgentsGraph:
     def _create_tool_nodes(self) -> dict[str, ToolNode]:
         """Create tool nodes for different data sources using abstract methods."""
         return {
+            "industry": ToolNode(build_industry_tools(getattr(self, "config", DEFAULT_CONFIG))),
             "market": ToolNode(
                 [
                     # Core stock data tools
@@ -240,6 +245,7 @@ class TradingAgentsGraph:
             "fundamentals": ToolNode(
                 [
                     # Fundamental analysis tools
+                    get_etf_fundamentals,
                     get_fundamentals,
                     get_balance_sheet,
                     get_cashflow,
@@ -363,14 +369,29 @@ class TradingAgentsGraph:
     def resolve_instrument_context(self, ticker: str, asset_type: str = "stock") -> str:
         """Resolve ticker identity once and return the full instrument context.
 
-        Deterministic yfinance lookup (cached, fail-open) injected into a
+        Deterministic configured-provider lookup (cached, fail-open) injected into a
         context string so every agent anchors to the real company instead of
         hallucinating one from the price chart (#814). Both the propagate()
         path and the CLI call this so the resolved identity reaches the whole
         graph regardless of entry point.
         """
         identity = resolve_instrument_identity(ticker)
-        return build_instrument_context(ticker, asset_type, identity)
+        # Local CLI/Web enter in broad stock mode. Confirmed ETF metadata
+        # selects fund analysis; an order's explicit ETF type survives outages.
+        # Reset on every run so reuse of this graph cannot leak the previous type.
+        self.resolved_asset_type = (
+            "etf" if asset_type != "crypto" and identity.get("quote_type") == "ETF" else asset_type
+        )
+        requested = getattr(self, "requested_analysts", getattr(self, "selected_analysts", ()))
+        if requested:
+            effective = applicable_analysts(requested, self.resolved_asset_type)
+            if not effective:
+                raise ValueError("No selected analysts support the resolved asset type")
+            if effective != self.selected_analysts:
+                self.selected_analysts = effective
+                self.workflow = self.graph_setup.setup_graph(effective)
+                self.graph = self.workflow.compile()
+        return build_instrument_context(ticker, self.resolved_asset_type, identity)
 
     def _memory_as_of(self, trade_date) -> str | None:
         """Point-in-time cutoff for past-context lessons (#1251).
@@ -391,13 +412,19 @@ class TradingAgentsGraph:
         silently continuing the previous graph (#1089).
         """
         return "|".join([
+            # Older checkpoints classified all ETF inputs as company stocks.
+            # Start fresh once after introducing the fund-specific tool branch.
+            "fundamentals=etf-v1",
             "analysts=" + ",".join(self.selected_analysts),
             f"debate={self.config['max_debate_rounds']}",
             f"risk={self.config['max_risk_discuss_rounds']}",
             f"asset={asset_type}",
             "vendors=" + json.dumps(self.config.get("data_vendors", {}), sort_keys=True),
             "tools=" + json.dumps(self.config.get("tool_vendors", {}), sort_keys=True),
-        ])
+        ]) + ("|industry=v2:" + json.dumps({
+            "sources": self.config.get("industry_sources", DEFAULT_CONFIG["industry_sources"]),
+            "related_limit": self.config.get("industry_max_related_companies", 3),
+        }, sort_keys=True) if "industry" in self.selected_analysts else "")
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
         """Run the trading agents graph for a company on a specific date.
@@ -420,10 +447,12 @@ class TradingAgentsGraph:
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
         self._resolve_pending_entries(company_name)
 
-        with self.checkpoint_scope(company_name, trade_date, asset_type) as thread_id_value:
+        instrument_context = self.resolve_instrument_context(company_name, asset_type)
+        effective_asset = getattr(self, "resolved_asset_type", asset_type)
+        with self.checkpoint_scope(company_name, trade_date, effective_asset) as thread_id_value:
             return self._run_graph(
-                company_name, trade_date, asset_type=asset_type,
-                checkpoint_thread_id=thread_id_value,
+                company_name, trade_date, asset_type=effective_asset,
+                checkpoint_thread_id=thread_id_value, instrument_context=instrument_context,
             )
 
     def begin_checkpoint(self, company_name, trade_date, asset_type: str = "stock") -> str | None:
@@ -505,7 +534,7 @@ class TradingAgentsGraph:
         return write_report_tree(final_state, ticker, save_path)
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
-                   checkpoint_thread_id: str | None = None):
+                   checkpoint_thread_id: str | None = None, instrument_context: str | None = None):
         """Execute the graph and write the resulting state to disk and memory log."""
         # Initialize state — inject memory log context for PM and the
         # deterministically resolved instrument identity for all agents. On a
@@ -514,11 +543,12 @@ class TradingAgentsGraph:
         past_context = self.memory_log.get_past_context(
             company_name, as_of=self._memory_as_of(trade_date)
         )
-        instrument_context = self.resolve_instrument_context(company_name, asset_type)
+        if instrument_context is None:
+            instrument_context = self.resolve_instrument_context(company_name, asset_type)
         init_agent_state = self.propagator.create_initial_state(
             company_name,
             trade_date,
-            asset_type=asset_type,
+            asset_type=getattr(self, "resolved_asset_type", asset_type),
             past_context=past_context,
             instrument_context=instrument_context,
         )
@@ -580,6 +610,7 @@ class TradingAgentsGraph:
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
             "fundamentals_report": final_state["fundamentals_report"],
+            "industry_report": final_state.get("industry_report", ""),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],

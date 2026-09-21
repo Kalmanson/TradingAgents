@@ -1,7 +1,7 @@
 import logging
 from functools import partial
 
-from . import fmp, indicators, market_data
+from . import fmp, indicators, market_data, yahoo
 from .alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -52,9 +52,10 @@ TOOLS_CATEGORIES = {
         ]
     },
     "fundamental_data": {
-        "description": "Company fundamentals",
+        "description": "Company and ETF fundamentals",
         "tools": [
             "get_fundamentals",
+            "get_etf_fundamentals",
             "get_balance_sheet",
             "get_cashflow",
             "get_income_statement"
@@ -115,6 +116,10 @@ VENDOR_METHODS = {
         "local": indicators.get_stock_stats_indicators_window,
     },
     # fundamental_data
+    "get_etf_fundamentals": {
+        "fmp": fmp.get_etf_fundamentals,
+        "yfinance": yahoo.get_etf_fundamentals,
+    },
     "get_fundamentals": {
         "fmp": fmp.get_fundamentals,
         "alpha_vantage": get_alpha_vantage_fundamentals,
@@ -183,10 +188,10 @@ def get_vendor(category: str, method: str = None, *, config: dict | None = None)
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
-def route_to_vendor(method: str, *args, **kwargs):
-    """Route method calls to appropriate vendor implementation with fallback support."""
+def route_to_vendor(method: str, *args, config: dict | None = None, **kwargs):
+    """Route using explicit vendor settings when supplied, otherwise the run config."""
     category = get_category_for_method(method)
-    vendor_config = get_vendor(category, method)
+    vendor_config = get_vendor(category, method, config=config)
     primary_vendors = [v.strip() for v in vendor_config.split(',')]
 
     if method not in VENDOR_METHODS:

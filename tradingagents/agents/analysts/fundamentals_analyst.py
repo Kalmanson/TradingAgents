@@ -3,6 +3,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     get_balance_sheet,
     get_cashflow,
+    get_etf_fundamentals,
     get_fundamentals,
     get_income_statement,
     get_instrument_context_from_state,
@@ -28,6 +29,23 @@ def create_fundamentals_analyst(llm):
             + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements."
             + get_language_instruction(),
         )
+
+        if state.get("asset_type") == "etf":
+            tools = [get_etf_fundamentals]
+            system_message = (
+                "You analyze an ETF, not an operating company. Call get_etf_fundamentals for the exact"
+                " fund ticker and analysis date. Cover strategy and stated benchmark, asset class, manager,"
+                " expense ratio with its reported units, AUM and currency, NAV, holdings, concentration,"
+                " sector exposures and liquidity. Explain how these affect the fund's investment case."
+                " Use only reported data; do not request corporate balance sheets, income statements,"
+                " cash flows or insider trades for the ETF. Separate fund metrics from holdings metrics."
+                " State provider, retrieval time and actual profile/holdings dates; flag missing dates"
+                " and stale snapshots. Current snapshots cannot support historical point-in-time claims."
+                " Distinguish missing data from a negative finding. Do not infer tracking error from"
+                " alpha versus SPY or calculate NAV premiums without synchronized observations."
+                " End with a Markdown table of evidence, limitations and implications."
+                + get_language_instruction()
+            )
 
         prompt = ChatPromptTemplate.from_messages(
             [

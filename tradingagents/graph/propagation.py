@@ -1,6 +1,7 @@
 # TradingAgents/graph/propagation.py
 
 from typing import Any
+from uuid import uuid4
 
 from tradingagents.agents.utils.agent_states import (
     InvestDebateState,
@@ -66,6 +67,8 @@ class Propagator:
             "fundamentals_report": "",
             "sentiment_report": "",
             "news_report": "",
+            "industry_report": "",
+            "industry_run_id": uuid4().hex,
         }
 
     def get_graph_args(self, callbacks: list | None = None) -> dict[str, Any]:

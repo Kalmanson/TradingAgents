@@ -233,3 +233,54 @@ def test_supplier_change_invalidates_checkpoint_signature():
     assert old != new
     graph.config["tool_vendors"] = {"get_stock_data": "yfinance"}
     assert TradingAgentsGraph._run_signature(graph, "stock") != new
+
+
+def test_etf_tool_branch_does_not_resume_legacy_company_checkpoints():
+    from types import SimpleNamespace
+
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    graph = SimpleNamespace(selected_analysts=["market", "fundamentals"], config={
+        "max_debate_rounds": 1, "max_risk_discuss_rounds": 1,
+        "data_vendors": {}, "tool_vendors": {},
+    })
+    current = TradingAgentsGraph._run_signature(graph, "stock")
+    legacy = current.removeprefix("fundamentals=etf-v1|")
+    assert current != legacy
+    assert thread_id("SPY", "2026-09-18", current) != thread_id("SPY", "2026-09-18", legacy)
+    assert current != TradingAgentsGraph._run_signature(graph, "etf")
+
+
+def test_industry_checkpoint_signature_tracks_selection_and_source_policy():
+    from types import SimpleNamespace
+
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    graph = SimpleNamespace(selected_analysts=("market",), config={"max_debate_rounds": 1, "max_risk_discuss_rounds": 1})
+    old = TradingAgentsGraph._run_signature(graph, "stock")
+    assert "industry=" not in old
+    graph.selected_analysts = ("market", "industry")
+    new = TradingAgentsGraph._run_signature(graph, "stock")
+    assert new != old and "industry=v2" in new
+    graph.config["industry_sources"] = ["sec"]
+    assert TradingAgentsGraph._run_signature(graph, "stock") != new
+
+
+def test_graph_reuse_restores_industry_after_etf_and_keeps_requested_selection(monkeypatch):
+    from unittest.mock import Mock
+
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    graph = object.__new__(TradingAgentsGraph)
+    graph.requested_analysts = ("market", "fundamentals", "industry")
+    graph.selected_analysts = graph.requested_analysts
+    graph.graph_setup = Mock()
+    identity = {"company_name": "Example", "quote_type": "ETF"}
+    monkeypatch.setattr("tradingagents.graph.trading_graph.resolve_instrument_identity", lambda ticker: identity)
+    graph.resolve_instrument_context("SPY")
+    assert graph.selected_analysts == ("market", "fundamentals")
+    assert graph.resolved_asset_type == "etf"
+    identity["quote_type"] = "EQUITY"
+    graph.resolve_instrument_context("NVDA")
+    assert graph.selected_analysts == graph.requested_analysts and graph.resolved_asset_type == "stock"
+    assert graph.graph_setup.setup_graph.call_count == 2

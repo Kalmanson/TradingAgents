@@ -3,7 +3,7 @@
 <section class="hero">
   <div class="hero-copy">
     <p class="eyebrow"><span class="status-dot"></span> A SECOND PERSPECTIVE ON YOUR NEXT INVESTMENT</p>
-    <h1>One stock.<br>Every angle.<br><em>Your committee.</em></h1>
+    <h1>One investment.<br>Every angle.<br><em>Your committee.</em></h1>
     <p class="hero-description">Go beyond a single opinion. A team of AI analysts examines the evidence, debates the case, and brings the risks into focus.</p>
     <div class="hero-details"><span>One-time payment</span><span>No account required</span><span>Your language</span></div>
     <div class="research-note"><span class="note-number">01—05</span><p>From market signals to the final decision.<br><strong>The complete discussion, in one report.</strong></p></div>
@@ -11,11 +11,12 @@
   <div class="purchase-card">
     <div class="card-heading"><span class="eyebrow">YOUR RESEARCH BRIEF</span><span class="paper-mark" aria-hidden="true">↗</span></div>
     <h2>Investment Committee Report</h2>
-    <p class="card-intro">Choose a US stock. We'll take it to the committee.</p>
+    <p class="card-intro">Choose a US stock{% if etf_symbols %} or supported ETF{% endif %}. We'll take it to the committee.</p>
     <form id="purchase-form" data-product-quote="{{ product.quote if product else '' }}">
-      <label for="ticker">Stock ticker <span>US-listed stocks</span></label>
+      <label for="ticker">Ticker <span>US stocks{% if etf_symbols %} &amp; selected ETFs{% endif %}</span></label>
       <input id="ticker" name="ticker" type="text" placeholder="e.g. RXRX" maxlength="10" required autocomplete="off" autocapitalize="characters" spellcheck="false">
       <div class="ticker-examples">Try <button type="button" data-ticker="RXRX">RXRX</button><button type="button" data-ticker="AAPL">AAPL</button><button type="button" data-ticker="NVDA">NVDA</button></div>
+      {% if etf_symbols %}<p class="field-help">Supported ETFs: {{ etf_symbols | join(", ") }}.</p>{% endif %}
       <label for="language">Report language</label>
       <select id="language" name="language">{% for code, language in languages.items() %}<option value="{{ code }}">{{ language[1] }}</option>{% endfor %}</select>
       <p class="field-help">Your selected language is saved with your order.</p>
@@ -40,7 +41,7 @@
 <section class="inside-section" aria-labelledby="inside-heading">
   <div class="section-heading"><div><p class="eyebrow">WHAT'S INSIDE</p><h2 id="inside-heading">Evidence. Debate. Perspective.</h2></div><p>A complete committee process,<br>from the first signal to the final view.</p></div>
   <div class="research-grid">
-    <article><span class="section-number">01</span><h3>The evidence</h3><p>Market technicals, sentiment, news, and business fundamentals.</p><span class="article-tag">FOUR ANALYST PERSPECTIVES</span></article>
+    <article><span class="section-number">01</span><h3>The evidence</h3><p>Market technicals, sentiment, news, and {% if etf_symbols %}company or fund{% else %}company{% endif %} fundamentals, plus industry and supply-chain research for individual stocks.</p><span class="article-tag">FIVE PERSPECTIVES FOR STOCKS</span></article>
     <article><span class="section-number">02</span><h3>The debate</h3><p>The bull case and the bear case, challenged before a trading view is formed.</p><span class="article-tag">BOTH SIDES OF THE THESIS</span></article>
     <article><span class="section-number">03</span><h3>The risk review</h3><p>Aggressive, neutral, and conservative perspectives inform the final decision.</p><span class="article-tag">A FULLER PICTURE OF RISK</span></article>
   </div>

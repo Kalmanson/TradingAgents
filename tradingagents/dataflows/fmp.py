@@ -43,6 +43,12 @@ def _failure(status: int | None, detail: str) -> tuple[VendorError, bool]:
                                         "daily request", "monthly request", "usage limit"))
             or ("limit reach" in detail and "upgrade" in detail)):
         return VendorRateLimitError("FMP request quota exhausted"), False
+    if status == 401:
+        return VendorNotConfiguredError("FMP authentication failed (HTTP 401)"), False
+    if status == 402:
+        return VendorNotConfiguredError("FMP endpoint is not included in the current subscription (HTTP 402)"), False
+    if status == 403:
+        return VendorNotConfiguredError("FMP access denied (HTTP 403); check endpoint permissions or access restrictions"), False
     if status in {401, 402, 403} or any(word in detail for word in (
         "invalid api", "invalid key", "unauthorized", "not authorized", "subscription",
         "upgrade", "premium", "restricted", "permission", "missing api",
@@ -174,7 +180,7 @@ def get_instrument_info(symbol: str) -> dict:
     info = rows[0]
     exchange = US_EXCHANGES.get(str(info.get("exchange") or "").upper())
     kind = None
-    if info.get("isEtf") is True:
+    if info.get("isEtf") is True and info.get("isActivelyTrading") is True:
         kind = "ETF"
     elif info.get("isFund") is True:
         kind = "MUTUALFUND"
@@ -184,6 +190,60 @@ def get_instrument_info(symbol: str) -> dict:
     return {"symbol": canonical, "provider": "fmp", "company_name": info.get("companyName"),
             "quote_type": kind, "exchange": exchange, "country": "US" if exchange else None,
             "currency": info.get("currency"), "sector": info.get("sector"), "industry": info.get("industry")}
+
+
+def get_etf_fundamentals(ticker: str, curr_date: str) -> str:
+    """Current fund profile and holdings; never substitute company financials."""
+    canonical = normalize_symbol(ticker)
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    cutoff = min(datetime.strptime(curr_date, "%Y-%m-%d").date(), today)
+    if cutoff < today:
+        raise NoMarketDataError(ticker, canonical, "FMP ETF data is a current snapshot, not historical point-in-time")
+    rows = _symbol_rows(_request("funds", "etf_info", symbol=canonical), canonical)
+    if len(rows) != 1 or not rows[0].get("name"):
+        raise NoMarketDataError(ticker, canonical, "FMP returned no unique ETF profile")
+    info = rows[0]
+    updated = pd.to_datetime(info.get("updatedAt"), errors="coerce", utc=True)
+    if updated is not None and not pd.isna(updated) and updated.date() > cutoff:
+        raise NoMarketDataError(ticker, canonical, "FMP ETF profile is dated after the analysis date")
+    holdings = _symbol_rows(_request("funds", "etf_holdings", symbol=canonical), canonical)
+    kept = []
+    for row in holdings:
+        stamp = pd.to_datetime(row.get("updatedAt"), errors="coerce", utc=True)
+        if stamp is not None and not pd.isna(stamp) and stamp.date() > cutoff:
+            continue
+        weight = pd.to_numeric(row.get("weightPercentage"), errors="coerce")
+        if not row.get("asset") or pd.isna(weight) or not math.isfinite(weight) or not 0 <= weight <= 100:
+            raise NoMarketDataError(ticker, canonical, "FMP ETF holdings have missing or invalid weights")
+        kept.append({"Asset": row["asset"], "Name": row.get("name") or "N/A",
+                     "Weight (%)": weight,
+                     "Updated at": stamp.isoformat() if stamp is not None and not pd.isna(stamp) else "N/A"})
+    if not kept:
+        raise NoMarketDataError(ticker, canonical, "FMP returned no ETF holdings available by the analysis date")
+    frame = (pd.DataFrame(kept).sort_values("Updated at").drop_duplicates("Asset", keep="last")
+             .sort_values("Weight (%)", ascending=False))
+    fields = (("Name", "name"), ("Strategy / benchmark description", "description"),
+              ("Asset class", "assetClass"), ("Fund manager", "etfCompany"),
+              ("Domicile (not listing country)", "domicile"), ("Inception date", "inceptionDate"),
+              ("Expense ratio (provider-reported)", "expenseRatio"),
+              ("Assets under management (provider-reported; currency not specified)", "assetsUnderManagement"),
+              ("NAV", "nav"), ("NAV currency", "navCurrency"),
+              ("Average volume (shares; provider window unspecified)", "avgVolume"),
+              ("Reported holdings count", "holdingsCount"))
+    lines = [f"{label}: {info.get(key) if info.get(key) is not None else 'N/A'}" for label, key in fields]
+    lines += ["Tracking error: N/A (requires the fund's matching index return series)",
+              "Premium / discount to NAV: N/A (requires synchronized market price and NAV)"]
+    sectors = info.get("sectorsList")
+    sector_text = (pd.DataFrame(sectors).to_csv(index=False)
+                   if isinstance(sectors, list) and sectors and all(isinstance(row, dict) for row in sectors)
+                   else "N/A")
+    return (f"# ETF Fundamentals for {canonical}\n# Provider: fmp\n"
+            f"# Retrieved at: {datetime.now(timezone.utc).isoformat()}\n"
+            f"# Profile updated at: {updated.isoformat() if updated is not None and not pd.isna(updated) else 'N/A'}\n"
+            "# Current snapshot only; retrieval time is not the holdings date. Missing dates are unverified.\n\n"
+            + "\n".join(lines)
+            + f"\n\n## Largest reported holdings (up to 10 of {len(frame)} returned)\n" + frame.head(10).to_csv(index=False)
+            + "\n## Sector exposures (provider-reported)\n" + sector_text)
 
 
 def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:

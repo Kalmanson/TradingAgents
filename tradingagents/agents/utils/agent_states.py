@@ -59,6 +59,8 @@ class AgentState(MessagesState):
         str, "Report from the News Researcher of current world affairs"
     ]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
+    industry_report: Annotated[str, "Report from the Industry and Supply Chain Analyst"]
+    industry_run_id: Annotated[str, "Run-scoped industry tool budget and cache identity"]
 
     # researcher team discussion step
     investment_debate_state: Annotated[

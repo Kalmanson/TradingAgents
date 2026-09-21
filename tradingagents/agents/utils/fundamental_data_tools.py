@@ -6,6 +6,19 @@ from tradingagents.dataflows.interface import route_to_vendor
 
 
 @tool
+def get_etf_fundamentals(
+    ticker: Annotated[str, "ETF ticker symbol"],
+    curr_date: Annotated[str, "analysis date, yyyy-mm-dd"],
+) -> str:
+    """Retrieve ETF strategy, fees, assets, holdings and exposures from the configured fundamental_data vendor.
+
+    Current snapshots only. Historical holdings, tracking error and synchronized
+    NAV premiums are unavailable; do not replace these with company financials.
+    """
+    return route_to_vendor("get_etf_fundamentals", ticker, curr_date)
+
+
+@tool
 def get_fundamentals(
     ticker: Annotated[str, "ticker symbol"],
     curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"],

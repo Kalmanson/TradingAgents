@@ -63,7 +63,9 @@ TradingAgents is a multi-agent trading framework that mirrors the dynamics of re
 Our framework decomposes complex trading tasks into specialized roles.
 
 ### Analyst Team
+
 - Fundamentals Analyst: Evaluates company financials and performance metrics, identifying intrinsic values and potential red flags.
+- Industry and Supply Chain Analyst: Explains industry cycles, upstream/downstream transmission, bargaining power, company exposures and falsification conditions using dated disclosures and industry data. Enabled for stocks; ETFs and crypto skip this role.
 - Sentiment Analyst: Aggregates news headlines, StockTwits, and Reddit chatter into a single sentiment read to gauge short-term market mood.
 - News Analyst: Monitors global news and macroeconomic indicators, interpreting the impact of events on market conditions.
 - Technical Analyst: Utilizes technical indicators (like MACD and RSI) to detect trading patterns and forecast price movements.
@@ -176,7 +178,7 @@ You will see a screen where you can select your desired tickers, analysis date, 
 价格、币种和税费方式从 Creem 商品读取，首页与订单使用相同来源；订单保存下单时的价格供支付核验。
 安装 `pip install ".[mvp]"` 并补齐 `.env` 后，运行 `tradingagents-mvp serve --mode test` 或 `--mode prod`。
 同一 `.env` 用 `CREEM_TEST_*`、`CREEM_PROD_*` 区分 Creem 凭据，其他配置共用；缺少必填项会直接拒绝启动并列出配置项。
-付费入口默认使用 FMP 行情、证券资料、基本面、财报、新闻和内部人交易，指标在本地计算；填写 `FMP_API_KEY` 并确认对应接口权限后使用。本地 CLI 和 Web 工作台默认仍使用 yfinance。
+付费入口默认使用 FMP 行情、证券资料、基本面、财报、新闻和内部人交易，指标在本地计算；填写 `FMP_API_KEY` 并确认对应接口权限后使用。本地 CLI 和 Web 工作台的这些分类默认仍使用 yfinance。新股票报告默认增加行业与产业链分析师，其 SEC、FMP、FRED 和官方文件来源独立组合，配置见[行业分析部署说明](docs/付费报告部署与运行.md#35-行业与产业链分析配置)。
 
 中文文档：[系统架构](docs/付费报告系统架构.md) · [部署与运行](docs/付费报告部署与运行.md) · [文档入口](docs/PAID_REPORT_MVP.md)。
 部署文档包含订单离线查询、报告导出、数据库备份恢复，以及 [FMP 配置与回滚](docs/付费报告部署与运行.md#34-fmp-数据源配置与回滚)、真实接口验收和常见故障处理。
@@ -271,7 +273,8 @@ rejected. The five-year indicator window, inclusive dates, stale-data guards
 and provider-isolated caches are shared with existing adapters. Reports show
 the latest available trading day; daily prices are not real-time quotes.
 `BRK.B` and `BRK-B` resolve to the same share class. ETFs work for prices and
-benchmarks, but cannot be purchased. Missing instrument flags or unsupported
+benchmarks. Paid ETF reports are disabled by default. When enabled, the reviewed
+allowlist supports SPY, QQQ, VOO, IVV, VTI, DIA and IWM. Missing instrument flags or unsupported
 exchanges block checkout; US-listed ADRs use listing country, not headquarters.
 
 FMP fundamentals use current profile, quote, TTM ratios and key metrics.
@@ -282,6 +285,33 @@ or disclosed after the cutoff. This does not provide historical restatement
 vintages. News is paginated, date-filtered and deduplicated; `global_news_queries`
 applies only to Yahoo search. Insider data is the latest up to 100 records,
 with transaction and filing dates, not a historical as-of query.
+
+ETF reports use `get_etf_fundamentals` in the existing `fundamental_data`
+category (`fmp` or `yfinance`, with the same tool overrides and explicit fallback
+rules). FMP calls `etf/info` and `etf/holdings`; Yahoo uses fund data for local
+analysis. The fund analyst covers strategy, fees, AUM, holdings and exposures;
+it does not use corporate financial statements. These are current snapshots,
+with source and available update dates; historical ETF snapshots, tracking error
+and synchronized NAV premiums are unavailable. Missing fields remain `N/A`.
+
+Set `TRADINGAGENTS_ETF_REPORTS_ENABLED=true` (or
+`config["etf_reports_enabled"] = True`) and restart to enable new paid ETF reports.
+The default is `false`: the storefront shows stocks only and rejects ETF orders
+before fund-data preflight. Existing orders, local analysis and benchmark prices
+continue to work. Explicit `base_config` takes precedence over environment values.
+
+Use `TRADINGAGENTS_ETF_ALLOWLIST=SPY,QQQ,VOO,IVV,VTI,DIA,IWM` (or
+`config["etf_allowlist"]`) to select paid ETFs; `none` disables new ETF purchases.
+The list is reviewed by the operator because provider metadata does not reliably
+identify leverage or inverse exposure. Listing and ETF type must still be verified;
+FMP also requires active trading. ETF checkout verifies fund-data availability
+using the storefront's own vendor settings before creating a payable order.
+The storefront displays the configured list.
+New orders persist `asset_type="etf"` through payment and queue recovery. Changing
+the list does not cancel existing purchases. Local CLI/Web infer ETF mode from
+resolved instrument metadata; explicit ETF requests remain ETF during identity
+outages. Confirm access to both ETF endpoints and run a complete sample report
+before enabling sales; profile access alone does not establish holdings access.
 
 SDK retries are disabled. The adapter retries transient failures at most twice,
 but does not retry authentication, plan permissions or exhausted quotas. Logs
@@ -302,6 +332,66 @@ Other sources (macro, prediction markets, social feeds) retain their own routing
 and licensing. See [FMP commercial plans](https://site.financialmodelingprep.com/developer/docs/pricing?planType=commercial),
 [configuration and rollback](docs/付费报告部署与运行.md#34-fmp-数据源配置与回滚)
 and [live smoke tests](docs/付费报告部署与运行.md#113-fmp-真实接口验收).
+
+### Industry and supply-chain analyst
+
+New stock runs include a fifth analyst, `industry`, after fundamentals and before
+the research debate. It explains the industry cycle, upstream/downstream
+transmission, bargaining power, company exposures, and catalysts/falsification.
+Fundamentals retains financial quality and valuation; news retains recent events.
+CLI and local Web selections can disable the role. ETFs and crypto skip it,
+including ETFs identified after ticker lookup. Explicit analyst lists in old
+tasks and orders keep their original selection.
+
+The initial scope is US stocks and SEC-reporting ADRs. Evidence combines SEC
+annual/quarterly filings and companyfacts, FMP profiles/revenue splits/peer
+candidates, official company documents, and applicable FRED, Census, EIA or
+WSTS indicators. NVIDIA and Microsoft have tested IR discovery paths; arbitrary
+company websites are not guaranteed. SEC-reported foreign issuers may have an
+annual filing without a US-style quarterly report. Related-company research is
+limited to three issuers and one level. Peer lists do not establish supply links.
+
+```python
+config["industry_sources"] = [
+    "sec", "fmp", "fred", "company_ir", "census", "eia", "wsts",
+]
+config["industry_max_related_companies"] = 3  # integer 0–3
+```
+
+These sources are combined, independently of the existing category fallback
+chains. FMP and FRED use their existing keys. SEC needs no key: set
+`SEC_USER_AGENT="TradingAgents contact@your-domain.com"`; this project otherwise
+uses its authorized `COMMERCE_SUPPORT_EMAIL`. The contact is sent only to SEC,
+never saved in orders or reports. Requests share a one-per-second SEC limiter
+inside the application process. A 403/429 stops further SEC network requests for
+that research run; transient failures retry at most once. Indexes cache for one
+hour, current public documents for six hours, accession-addressed filings
+indefinitely, under the existing run/order cache directory. Multiple deployment
+processes would need a shared external rate limiter.
+
+Historical runs filter SEC disclosure dates and request FRED vintages. Current
+FMP splits and IR/Census/EIA/WSTS files are excluded when their historical
+availability cannot be established. Each source retains dates, periods, units,
+URLs and availability notes. Missing sources remain explicit; no usable issuer
+disclosure produces an insufficient-evidence report without a model call.
+Generated reports receive bounded checks for output truncation, invented numerical conditions,
+unprovided citation URLs and WSTS unit conversion, with at most one revision.
+These checks do not replace review of all narrative claims.
+
+`industry_report` is supplied to both researchers, all three risk analysts and
+the research/portfolio managers. Exports include `1_analysts/industry.md` and the
+complete report. New paid orders save the source selection and related-company
+limit without contact addresses or API keys. Selecting the role or changing its
+source policy isolates checkpoints from incompatible runs.
+
+```bash
+.venv/bin/python scripts/check_industry_access.py --symbols NVDA XOM CAT MSFT --output-dir /tmp/industry-check
+.venv/bin/python scripts/check_industry_access.py --symbols NVDA --related TSM AMD MU --output-dir /tmp/industry-related
+.venv/bin/python scripts/check_industry_access.py --symbols NVDA --date 2025-06-01 --output-dir /tmp/industry-history
+```
+
+See the [source verification report](docs/行业分析数据源接入验证.md) for actual
+coverage, subscription failures, runtime and historical limitations.
 
 ### Marketstack daily market data
 

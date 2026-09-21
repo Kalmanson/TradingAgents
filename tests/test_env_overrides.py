@@ -158,3 +158,22 @@ def test_fmp_environment_selectors_and_key_are_independent(monkeypatch):
         dc = _reload_with_env(monkeypatch)
     assert all(dc.DEFAULT_CONFIG["data_vendors"][key] == "yfinance" for key in
                ("core_stock_apis", "instrument_data", "technical_indicators", "fundamental_data", "news_data"))
+
+
+@pytest.mark.parametrize("raw,expected", [(None, False), ("", False), ("true", True), ("false", False), ("1", True), ("0", False)])
+def test_etf_report_switch_defaults_off_and_parses_bool(monkeypatch, raw, expected):
+    overrides = {} if raw is None else {"TRADINGAGENTS_ETF_REPORTS_ENABLED": raw}
+    dc = _reload_with_env(monkeypatch, **overrides)
+    try:
+        assert dc.DEFAULT_CONFIG["etf_reports_enabled"] is expected
+        assert dc.DEFAULT_CONFIG["etf_allowlist"] == "SPY,QQQ,VOO,IVV,VTI,DIA,IWM"
+    finally:
+        _reload_with_env(monkeypatch)
+
+
+def test_etf_report_switch_rejects_invalid_boolean(monkeypatch):
+    try:
+        with pytest.raises(ValueError, match="TRADINGAGENTS_ETF_REPORTS_ENABLED"):
+            _reload_with_env(monkeypatch, TRADINGAGENTS_ETF_REPORTS_ENABLED="enabled")
+    finally:
+        _reload_with_env(monkeypatch)

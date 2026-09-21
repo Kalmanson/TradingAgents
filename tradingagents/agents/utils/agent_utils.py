@@ -9,6 +9,7 @@ from tradingagents.agents.utils.core_stock_tools import get_stock_data
 from tradingagents.agents.utils.fundamental_data_tools import (
     get_balance_sheet,
     get_cashflow,
+    get_etf_fundamentals,
     get_fundamentals,
     get_income_statement,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "get_stock_data",
     "get_indicators",
     "get_fundamentals",
+    "get_etf_fundamentals",
     "get_balance_sheet",
     "get_cashflow",
     "get_income_statement",
@@ -138,6 +140,7 @@ def build_instrument_context(
     than pattern-matching the price chart to a wrong one (#814).
     """
     is_crypto = asset_type == "crypto"
+    is_etf = asset_type == "etf" or (identity or {}).get("quote_type") == "ETF"
     instrument_label = "asset" if is_crypto else "instrument"
     context = (
         f"The {instrument_label} to analyze is `{ticker}`. "
@@ -149,7 +152,8 @@ def build_instrument_context(
     if identity:
         name = identity.get("company_name") or identity.get("name")
         if name:
-            details.append(f"{'Name' if is_crypto else 'Company'}: {name}")
+            name_label = "Fund" if is_etf else ("Name" if is_crypto else "Company")
+            details.append(f"{name_label}: {name}")
         sector, industry = identity.get("sector"), identity.get("industry")
         if sector and industry:
             details.append(f"Business classification: {sector} / {industry}")
@@ -171,6 +175,15 @@ def build_instrument_context(
         context += (
             " Treat it as a crypto asset rather than a company, and do not "
             "assume company fundamentals are available."
+        )
+    if is_etf:
+        context += (
+            " This instrument is an ETF. Analyze its investment strategy, benchmark, fees, holdings,"
+            " concentration, liquidity and underlying exposures. Do not treat the fund as an operating"
+            " company or request company financial statements or insider transactions for it."
+            " Separate fund-level data from the financials of its holdings. Missing ETF data is unavailable,"
+            " not evidence of poor business performance. Alpha versus SPY is a broad-market comparison,"
+            " not tracking error against the fund's own index. Do not invent holdings dates or NAV premiums."
         )
     return context
 
@@ -218,5 +231,4 @@ def create_msg_delete():
         return {"messages": removal_operations + [placeholder]}
 
     return delete_messages
-
 

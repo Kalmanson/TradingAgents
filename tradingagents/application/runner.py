@@ -21,24 +21,27 @@ from tradingagents.application.stats import StatsCallbackHandler
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
+    applicable_analysts,
     build_analyst_execution_plan,
     sync_analyst_tracker_from_chunk,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.reporting import write_report_tree
 
-ANALYST_ORDER = ("market", "social", "news", "fundamentals")
+ANALYST_ORDER = ("market", "social", "news", "fundamentals", "industry")
 ANALYST_AGENT_NAMES = {
     "market": "Market Analyst",
     "social": "Sentiment Analyst",
     "news": "News Analyst",
     "fundamentals": "Fundamentals Analyst",
+    "industry": "Industry and Supply Chain Analyst",
 }
 ANALYST_REPORT_MAP = {
     "market": "market_report",
     "social": "sentiment_report",
     "news": "news_report",
     "fundamentals": "fundamentals_report",
+    "industry": "industry_report",
 }
 FIXED_AGENTS = (
     "Bull Researcher",
@@ -95,8 +98,8 @@ class AnalysisRequest:
             raise ValueError("分析日期必须使用 YYYY-MM-DD 格式。") from exc
         if selected_date > date.today():
             raise ValueError("分析日期不能晚于今天。")
-        if self.asset_type not in {"stock", "crypto"}:
-            raise ValueError("资产类型必须是 stock 或 crypto。")
+        if self.asset_type not in {"stock", "etf", "crypto"}:
+            raise ValueError("资产类型必须是 stock、etf 或 crypto。")
         if not self.analysts:
             raise ValueError("至少选择一位分析师。")
         unknown = set(self.analysts) - set(ANALYST_ORDER)
@@ -104,6 +107,8 @@ class AnalysisRequest:
             raise ValueError(f"未知分析师：{', '.join(sorted(unknown))}")
         if self.asset_type == "crypto" and "fundamentals" in self.analysts:
             raise ValueError("加密资产暂不支持基本面分析师。")
+        if self.asset_type != "stock" and "industry" in self.analysts:
+            raise ValueError("行业与产业链分析师仅支持普通股票。")
         if self.research_depth not in {1, 3, 5}:
             raise ValueError("研究深度必须是 1、3 或 5。")
         if not self.llm_provider.strip():
@@ -117,10 +122,11 @@ class AnalysisRequest:
 
     def normalized(self, config: dict | None = None) -> AnalysisRequest:
         ticker = normalize_ticker(self.ticker, config)
-        asset_type = "crypto" if ticker.upper().endswith(CRYPTO_SUFFIXES) else "stock"
+        asset_type = "crypto" if ticker.upper().endswith(CRYPTO_SUFFIXES) else (
+            "etf" if self.asset_type == "etf" else "stock"
+        )
         analysts = tuple(key for key in ANALYST_ORDER if key in self.analysts)
-        if asset_type == "crypto":
-            analysts = tuple(key for key in analysts if key != "fundamentals")
+        analysts = applicable_analysts(analysts, asset_type)
         return AnalysisRequest(
             **{
                 **asdict(self),
@@ -453,16 +459,22 @@ class AnalysisRunner:
             instrument_context = graph.resolve_instrument_context(
                 request.ticker, request.asset_type
             )
+            effective_asset = getattr(graph, "resolved_asset_type", request.asset_type)
+            effective_analysts = tuple(getattr(graph, "selected_analysts", request.analysts))
+            tracker = _ProgressTracker(effective_analysts)
+            yield AnalysisEvent("analysts_resolved", {
+                "analysts": list(effective_analysts), "asset_type": effective_asset,
+            })
             initial_state = graph.propagator.create_initial_state(
                 request.ticker,
                 request.analysis_date,
-                asset_type=request.asset_type,
+                asset_type=getattr(graph, "resolved_asset_type", request.asset_type),
                 past_context=past_context,
                 instrument_context=instrument_context,
             )
             graph_args = graph.propagator.get_graph_args(callbacks=[self.stats_handler])
             checkpoint_tid = graph.begin_checkpoint(
-                request.ticker, request.analysis_date, request.asset_type
+                request.ticker, request.analysis_date, effective_asset
             )
             if checkpoint_tid is not None:
                 graph_args.setdefault("config", {}).setdefault("configurable", {})[
@@ -499,7 +511,7 @@ class AnalysisRunner:
             if self.artifact_dir is not None:
                 report_path = write_report_tree(final_state, request.ticker, self.artifact_dir)
             graph.clear_checkpoint_on_success(
-                request.ticker, request.analysis_date, request.asset_type
+                request.ticker, request.analysis_date, effective_asset
             )
             stats = {
                 **self.stats_handler.get_stats(),

@@ -1627,11 +1627,13 @@ def test_marketstack_checkout_and_paid_queue_keep_order_configuration(commerce, 
     from tradingagents.dataflows import marketstack, yahoo
     from tradingagents.dataflows.config import set_config
 
+    monkeypatch.setenv("TRADINGAGENTS_ETF_REPORTS_ENABLED", "true")
     c = commerce
     for env_var in ("TRADINGAGENTS_CORE_STOCK_VENDOR", "TRADINGAGENTS_TECHNICAL_INDICATORS_VENDOR",
                     "TRADINGAGENTS_INSTRUMENT_VENDOR"):
         monkeypatch.delenv(env_var, raising=False)
     config = deepcopy(c.service.base_config)
+    config["etf_reports_enabled"] = True
     config["data_vendors"].update({"core_stock_apis": "marketstack", "technical_indicators": "local",
                                    "instrument_data": "marketstack"})
     if not explicit_config:
@@ -1648,8 +1650,11 @@ def test_marketstack_checkout_and_paid_queue_keep_order_configuration(commerce, 
             "stock_exchange": {"mic": "XNAS", "country_code": "USA"},
         },
     ))
+    from tradingagents.dataflows import interface
+    monkeypatch.setitem(interface.VENDOR_METHODS["get_etf_fundamentals"], "yfinance", lambda *a: "ETF data")
+    monkeypatch.setitem(interface.VENDOR_METHODS["get_etf_fundamentals"], "fmp", lambda *a: "ETF data")
     key = "marketstack-checkout-configuration-12345"
-    if kind != "equity":
+    if kind is None:
         with pytest.raises(ProviderUnavailable if kind is None else ValueError):
             service.create_checkout(ticker, "en", key)
         assert not c.transport.checkouts
@@ -1657,6 +1662,7 @@ def test_marketstack_checkout_and_paid_queue_keep_order_configuration(commerce, 
     else:
         order = service.create_checkout(ticker, "en", key)
         profile = json.loads(order["params_json"])
+        assert profile["request"]["asset_type"] == ("etf" if kind == "etf" else "stock")
         assert profile["config"]["data_vendors"]["core_stock_apis"] == "marketstack"
         assert "purchase-secret-key" not in order["params_json"]
         event = c.event(order)
@@ -1780,16 +1786,28 @@ def test_fmp_checkout_snapshot_and_paid_queue(commerce, monkeypatch, fmp_http, s
         "isEtf": True if kind == "etf" else (None if kind == "unknown" else False),
         "isFund": False, "isActivelyTrading": True,
     }])
+    profile_response = fmp_http.respond
+
+    def with_fund_data(endpoint, params):
+        if endpoint == "etf/info":
+            return 200, [{"symbol": params["symbol"], "name": "Verified fund"}]
+        if endpoint == "etf/holdings":
+            return 200, [{"symbol": params["symbol"], "asset": "AAPL", "weightPercentage": 5}]
+        return profile_response(endpoint, params)
+
+    fmp_http.respond = with_fund_data
+    monkeypatch.setenv("TRADINGAGENTS_ETF_REPORTS_ENABLED", "true")
     c = commerce
     service = CommerceService(c.settings, c.store, creem=c.service.creem, email=c.service.email)
     key = "fmp-checkout-configuration-1234567"
-    if kind != "equity":
+    if kind not in {"equity", "etf"}:
         with pytest.raises((ProviderUnavailable, ValueError)):
             service.create_checkout(symbol, "en", key)
         assert c.store.get_order(key, by="idempotency_key") is None and not c.transport.checkouts
     else:
         order = service.create_checkout(symbol, "en", key)
         profile = json.loads(order["params_json"])
+        assert profile["request"]["asset_type"] == ("etf" if kind == "etf" else "stock")
         vendors = profile["config"]["data_vendors"]
         assert all(vendors[key] == "fmp" for key in ("core_stock_apis", "instrument_data", "fundamental_data", "news_data"))
         assert vendors["technical_indicators"] == "local"
@@ -1800,6 +1818,7 @@ def test_fmp_checkout_snapshot_and_paid_queue(commerce, monkeypatch, fmp_http, s
         event = c.event(order)
         assert service.process_webhook(event, json.dumps(event).encode()) == "PROCESSED"
         run = c.store.tasks.list_runs()[0]
+        assert AnalysisRequest.from_dict(json.loads(run["request_json"])).normalized().asset_type == profile["request"]["asset_type"]
         runner = Mock()
         monkeypatch.setattr(service_module, "AnalysisRunner", runner)
         service.runner_factory(AnalysisRequest.from_dict(json.loads(run["request_json"])),
@@ -1828,3 +1847,229 @@ def test_fmp_default_missing_key_blocks_checkout_before_http(commerce, monkeypat
     assert not fmp_http.calls and not commerce.transport.checkouts
     assert commerce.store.get_order(key, by="idempotency_key") is None
     yahoo_call.assert_not_called()
+
+
+@pytest.mark.integration
+def test_etf_storefront_allowlist_configuration_and_order_recovery(commerce, monkeypatch, fmp_http):
+    import json
+
+    from tradingagents.commerce.service import CommerceService
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    monkeypatch.setenv("TRADINGAGENTS_ETF_REPORTS_ENABLED", "true")
+    c = commerce
+    monkeypatch.setenv("TRADINGAGENTS_ETF_ALLOWLIST", " spy, qqq,SPY ")
+    fmp_http.respond = lambda endpoint, params: (200, [{
+        "symbol": params["symbol"], "companyName": "Verified fund", "exchange": "NYSE ARCA",
+        "isEtf": True, "isFund": False, "isActivelyTrading": True,
+    }])
+    profile_response = fmp_http.respond
+
+    def with_fund_data(endpoint, params):
+        if endpoint == "etf/info":
+            return 200, [{"symbol": params["symbol"], "name": "Verified fund"}]
+        if endpoint == "etf/holdings":
+            return 200, [{"symbol": params["symbol"], "asset": "AAPL", "weightPercentage": 5}]
+        return profile_response(endpoint, params)
+
+    fmp_http.respond = with_fund_data
+    service = CommerceService(c.settings, c.store, creem=c.service.creem, email=c.service.email)
+    c.service.base_config["etf_reports_enabled"] = True
+    c.service.base_config["etf_allowlist"] = service.base_config["etf_allowlist"]
+    assert "Supported ETFs: SPY, QQQ." in c.client.get("/").text
+    assert DEFAULT_CONFIG["etf_allowlist"] != service.base_config["etf_allowlist"]
+    with pytest.raises(ValueError):
+        service.create_checkout("TQQQ", "en", "unsupported-etf-checkout-key-123")
+    assert c.store.get_order("unsupported-etf-checkout-key-123", by="idempotency_key") is None
+    assert not c.transport.checkouts
+    order = service.create_checkout("SPY", "en", "etf-recover-checkout-key-123456")
+    profile = json.loads(order["params_json"])
+    assert profile["request"]["asset_type"] == "etf"
+    service.base_config["etf_reports_enabled"] = False
+    event = c.event(order)
+    assert service.process_webhook(event, json.dumps(event).encode()) == "PROCESSED"
+    run = c.store.tasks.claim_next()
+    assert c.store.tasks.recover_interrupted() == 1
+    request = AnalysisRequest.from_dict(json.loads(run["request_json"])).normalized()
+    assert request.asset_type == "etf" and "fundamentals" in request.analysts
+    with pytest.raises(ValueError):
+        service.create_checkout("SPY", "en", "etf-disabled-checkout-key-12345")
+    # Explicit base_config takes precedence over environment selection.
+    explicit = CommerceService(c.settings, c.store, base_config={**service.base_config, "etf_allowlist": "IVV"})
+    assert explicit.base_config["etf_allowlist"] == "IVV"
+    bad = {**service.base_config, "etf_allowlist": "SPY,*"}
+    with pytest.raises(ValueError, match="etf_allowlist"):
+        CommerceService(c.settings, c.store, base_config=bad)
+
+
+@pytest.mark.parametrize("asset_type,identity_type,expected", [
+    ("stock", "ETF", "etf"), ("etf", None, "etf"), ("stock", "EQUITY", "stock"),
+])
+def test_etf_direct_and_streaming_runs_preserve_analysis_mode(monkeypatch, asset_type, identity_type, expected):
+    from dataclasses import replace
+    from types import MethodType
+    from unittest.mock import Mock
+
+    from tradingagents.graph import trading_graph
+
+    monkeypatch.setattr(trading_graph, "resolve_instrument_identity", lambda symbol: {
+        "quote_type": identity_type} if identity_type else {})
+    graph = _FakeTradingGraph()
+    graph.resolve_instrument_context = MethodType(trading_graph.TradingAgentsGraph.resolve_instrument_context, graph)
+    graph.propagator.create_initial_state = Mock(return_value={"messages": []})
+    events = list(AnalysisRunner(replace(_request("SPY"), asset_type=asset_type), graph_factory=lambda *args, **kw: graph).stream())
+    assert any(event.event_type == "completed" for event in events)
+    assert graph.propagator.create_initial_state.call_args.kwargs["asset_type"] == expected
+    graph.debug = False
+    graph.graph.invoke = Mock(return_value={"final_trade_decision": "Hold"})
+    trading_graph.TradingAgentsGraph._run_graph(graph, "SPY", "2026-09-18", asset_type)
+    assert graph.propagator.create_initial_state.call_args.kwargs["asset_type"] == expected
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failure", ["permission", "empty", "timeout"])
+def test_etf_preflight_blocks_order_when_fund_data_unavailable(commerce, monkeypatch, fmp_http, failure, caplog):
+    import logging
+    from unittest.mock import Mock
+
+    import requests
+
+    from tradingagents.commerce.creem import ProviderUnavailable
+    from tradingagents.commerce.service import CommerceService
+    from tradingagents.dataflows import fmp, yahoo
+    from tradingagents.dataflows.config import set_config
+
+    # An unrelated local analysis must never select Yahoo for this purchase.
+    set_config({"data_vendors": {"fundamental_data": "yfinance"}})
+    monkeypatch.setattr(yahoo.yf, "Ticker", Mock(side_effect=AssertionError("Unexpected Yahoo")))
+    monkeypatch.setattr(fmp.time, "sleep", lambda seconds: None)
+    monkeypatch.delenv("TRADINGAGENTS_ETF_ALLOWLIST", raising=False)
+    monkeypatch.setenv("TRADINGAGENTS_ETF_REPORTS_ENABLED", "true")
+    c = commerce
+    service = CommerceService(c.settings, c.store, creem=c.service.creem, email=c.service.email)
+
+    def respond(endpoint, params):
+        if endpoint == "profile":
+            return 200, [{"symbol": "SPY", "companyName": "Fund", "isEtf": True,
+                          "isFund": False, "isActivelyTrading": True, "exchange": "AMEX"}]
+        assert endpoint == "etf/info"
+        if failure == "timeout":
+            raise requests.Timeout("FMP-TEST-SECRET")
+        return (402, {"Error Message": "FMP-TEST-SECRET subscription required"}) if failure == "permission" else (200, [])
+
+    fmp_http.respond = respond
+    with caplog.at_level(logging.WARNING), pytest.raises(ProviderUnavailable, match="ETF fund data"):
+        service.create_checkout("SPY", "en", "etf-preflight-blocked-1234567")
+    assert c.store.get_order("etf-preflight-blocked-1234567", by="idempotency_key") is None
+    assert not c.transport.checkouts
+    assert len(fmp_http.calls) == (4 if failure == "timeout" else 2)
+    assert "FMP-TEST-SECRET" not in caplog.text
+    yahoo.yf.Ticker.assert_not_called()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("override", [None, "false", "0", "off"])
+def test_etf_reports_disabled_block_api_before_fund_data_and_hide_ui(commerce, monkeypatch, fmp_http, override):
+    from tradingagents.commerce.service import CommerceService
+
+    c = commerce
+    monkeypatch.delenv("TRADINGAGENTS_ETF_REPORTS_ENABLED", raising=False)
+    if override is not None:
+        monkeypatch.setenv("TRADINGAGENTS_ETF_REPORTS_ENABLED", override)
+    service = CommerceService(c.settings, c.store, creem=c.service.creem, email=c.service.email)
+    assert service.base_config["etf_reports_enabled"] is False
+    assert "SPY" in service.base_config["etf_allowlist"]  # Pausing preserves the reviewed list.
+    c.service.base_config = service.base_config
+    c.service.stock_validator = service.stock_validator
+
+    def respond(endpoint, params):
+        assert endpoint == "profile", "Disabled ETF sales must not request fund data"
+        return 200, [{"symbol": params["symbol"], "companyName": "Instrument", "exchange": "NYSE",
+                      "isEtf": params["symbol"] == "SPY", "isFund": False, "isActivelyTrading": True}]
+
+    fmp_http.respond = respond
+    page = c.client.get("/").text
+    assert "Choose a US stock." in page
+    assert "Supported ETFs:" not in page and "selected ETFs" not in page
+    key = "etf-feature-disabled-order-12345"
+    response = c.client.post("/api/orders", json={"ticker": "SPY", "language": "en"},
+                             headers={"Idempotency-Key": key})
+    assert response.status_code == 422 and "ETF reports are currently disabled" in response.text
+    assert not c.transport.checkouts and c.store.get_order(key, by="idempotency_key") is None
+    c.purchase(ticker="AAPL")  # Stocks still reach checkout under the same configuration.
+    assert len(c.transport.checkouts) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("env_value,explicit_value", [("true", False), ("false", True)])
+def test_etf_switch_explicit_base_config_overrides_environment(commerce, monkeypatch, env_value, explicit_value):
+    from tradingagents.commerce.service import CommerceService
+
+    monkeypatch.setenv("TRADINGAGENTS_ETF_REPORTS_ENABLED", env_value)
+    config = {**commerce.service.base_config, "etf_reports_enabled": explicit_value}
+    service = CommerceService(commerce.settings, commerce.store, base_config=config)
+    assert service.base_config["etf_reports_enabled"] is explicit_value
+    assert config["etf_reports_enabled"] is explicit_value
+    for invalid in ("false", "true", 1, None):
+        with pytest.raises(ValueError, match="etf_reports_enabled"):
+            CommerceService(commerce.settings, commerce.store, base_config={**config, "etf_reports_enabled": invalid})
+
+
+def test_industry_report_is_saved_and_old_requests_keep_their_selection(tmp_path):
+    state = {**_state(), "industry_report": "INDUSTRY_CATALYST_EVIDENCE"}
+    complete = write_report_tree(state, "NVDA", tmp_path)
+    assert (tmp_path / "1_analysts" / "industry.md").read_text() == "INDUSTRY_CATALYST_EVIDENCE"
+    assert "Industry and Supply Chain Analyst" in complete.read_text()
+    original = _request().to_dict()
+    restored = AnalysisRequest.from_dict(original).normalized()
+    assert "industry" not in restored.analysts
+    selected = AnalysisRequest(**{**_request().__dict__, "analysts": ("market", "fundamentals", "industry")})
+    assert selected.normalized().analysts[-1] == "industry"
+    assert AnalysisRequest(**{**selected.__dict__, "asset_type": "etf"}).normalized().analysts == ("market", "fundamentals")
+    assert AnalysisRequest(**{**selected.__dict__, "ticker": "BTC-USD"}).normalized().analysts == ("market",)
+
+
+def test_late_etf_resolution_updates_progress_and_checkpoint_asset(tmp_path):
+    captured = {}
+
+    class ETFGraph(_FakeTradingGraph):
+        def resolve_instrument_context(self, ticker, asset_type):
+            self.resolved_asset_type = "etf"
+            self.selected_analysts = ("market",)
+            return "ETF context"
+
+        def begin_checkpoint(self, ticker, analysis_date, asset_type):
+            captured["checkpoint_asset"] = asset_type
+            return "etf-thread"
+
+        def clear_checkpoint_on_success(self, ticker, analysis_date, asset_type):
+            captured["clear_asset"] = asset_type
+
+    request = AnalysisRequest(**{**_request("SPY").__dict__, "analysts": ("market", "industry")})
+    events = list(AnalysisRunner(request, artifact_dir=tmp_path, graph_factory=ETFGraph).stream())
+    assert captured == {"checkpoint_asset": "etf", "clear_asset": "etf"}
+    resolved = next(event.payload for event in events if event.event_type == "analysts_resolved")
+    assert resolved["analysts"] == ["market"]
+    for event in events:
+        if event.event_type == "progress":
+            assert "Industry and Supply Chain Analyst" not in event.payload["agents"]
+            assert event.payload["reports_total"] == 4
+
+
+def test_paid_profile_industry_configuration_is_nonsecret_and_asset_specific():
+    from tradingagents.commerce.profile import build_profile
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    config = {**DEFAULT_CONFIG, "industry_sources": ["sec", "fred"], "industry_max_related_companies": 2,
+              "SEC_USER_AGENT": "sensitive@example.com", "FMP_API_KEY": "secret-key"}
+    stock = build_profile("NVDA", "zh-CN", config)
+    assert stock["request"]["analysts"][-1] == "industry"
+    assert stock["config"]["industry_sources"] == ["sec", "fred"]
+    assert stock["config"]["industry_max_related_companies"] == 2
+    assert "SEC_USER_AGENT" not in stock["config"] and "FMP_API_KEY" not in stock["config"]
+    fund = build_profile("SPY", "zh-CN", config, asset_type="etf")
+    assert "industry" not in fund["request"]["analysts"]
+    minimal = {key: config.get(key) for key in ("llm_provider", "quick_think_llm", "deep_think_llm", "backend_url")}
+    defaults = build_profile("NVDA", "zh-CN", minimal)["config"]
+    assert defaults["industry_sources"] == DEFAULT_CONFIG["industry_sources"]
+    assert defaults["industry_max_related_companies"] == 3

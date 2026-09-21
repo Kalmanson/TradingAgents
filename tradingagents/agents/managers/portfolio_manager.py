@@ -27,6 +27,12 @@ def create_portfolio_manager(llm):
 
     def portfolio_manager_node(state) -> dict:
         instrument_context = get_instrument_context_from_state(state)
+        industry_report = state.get("industry_report", "")
+        industry_section = (
+            "Industry and supply chain report: preserve material catalysts, falsification conditions and "
+            "evidence gaps in the decision; do not turn an inference into a fact.\n"
+            + industry_report + "\n" if industry_report else ""
+        )
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
@@ -43,6 +49,7 @@ def create_portfolio_manager(llm):
         prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
 
 {instrument_context}
+{industry_section}
 
 ---
 

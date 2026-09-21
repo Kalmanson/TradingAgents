@@ -221,6 +221,116 @@ def test_alpha_vantage_structured_adjustment_uses_raw_volume(monkeypatch):
     assert frame.iloc[0]["Close"] == 50 and frame.iloc[0]["Volume"] == 1000
 
 
+def test_etf_fmp_profile_holdings_route_without_yahoo(fmp_http, monkeypatch):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from tradingagents.dataflows import yahoo
+
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    future = str(today + timedelta(days=1))
+    yahoo_call = mock.Mock(side_effect=AssertionError("Unexpected Yahoo"))
+    monkeypatch.setattr(yahoo.yf, "Ticker", yahoo_call)
+    set_config({"data_vendors": {"fundamental_data": "fmp"}})
+
+    def respond(endpoint, params):
+        assert params == {"symbol": "SPY"}
+        if endpoint == "etf/info":
+            return 200, [{"symbol": "SPY", "name": "Test fund", "assetClass": "Equity",
+                          "expenseRatio": 0.09, "nav": 600, "navCurrency": "USD",
+                          "updatedAt": str(today), "holdingsCount": 500,
+                          "sectorsList": [{"industry": "Technology", "exposure": 30}]}]
+        assert endpoint == "etf/holdings"
+        return 200, [{"symbol": "SPY", "asset": f"H{i}", "weightPercentage": i,
+                      "updatedAt": str(today)} for i in range(1, 12)] + [
+                          {"symbol": "SPY", "asset": "FUTURE", "weightPercentage": 99, "updatedAt": future}]
+
+    fmp_http.respond = respond
+    report = interface.route_to_vendor("get_etf_fundamentals", "spy", str(today))
+    assert "Provider: fmp" in report and "Test fund" in report
+    assert "0.09" in report and "USD" in report and "Technology" in report
+    assert "10 of 11 returned" in report and "H11,N/A,11" in report
+    assert "H1,N/A,1," not in report and "FUTURE" not in report
+    assert "Tracking error: N/A" in report
+    assert "Current snapshot only" in report and str(today) in report
+    assert len(fmp_http.calls) == 2
+    yahoo_call.assert_not_called()
+
+
+@pytest.mark.parametrize("problem", ["historical", "future_profile", "wrong_symbol", "empty_holdings", "bad_weight", "permission"])
+def test_etf_fmp_unavailable_data_and_permissions_fail_without_yahoo(fmp_http, monkeypatch, problem):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from tradingagents.dataflows import fmp, yahoo
+    from tradingagents.dataflows.errors import VendorError
+
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    monkeypatch.setattr(yahoo.yf, "Ticker", mock.Mock(side_effect=AssertionError("Unexpected Yahoo")))
+
+    def respond(endpoint, params):
+        if endpoint == "etf/info":
+            return 200, [{"symbol": "QQQ" if problem == "wrong_symbol" else "SPY", "name": "Test fund",
+                          "updatedAt": str(today + timedelta(days=1) if problem == "future_profile" else today)}]
+        if problem == "permission":
+            return 403, {"Error Message": "FMP-TEST-SECRET subscription required"}
+        if problem == "empty_holdings":
+            return 200, []
+        return 200, [{"symbol": "SPY", "asset": "AAPL", "weightPercentage": None, "updatedAt": str(today)}]
+
+    fmp_http.respond = respond
+    with pytest.raises((NoMarketDataError, VendorError)) as error:
+        fmp.get_etf_fundamentals("SPY", str(today - timedelta(days=1) if problem == "historical" else today))
+    assert "FMP-TEST-SECRET" not in str(error.value)
+    assert len(fmp_http.calls) <= 2  # no retry for missing data or denied plan
+    if problem == "historical":
+        assert not fmp_http.calls
+    yahoo.yf.Ticker.assert_not_called()
+
+
+def test_etf_tool_override_and_explicit_fallback(monkeypatch):
+    from tradingagents.dataflows.errors import VendorNotConfiguredError
+
+    fmp_call = mock.Mock(side_effect=VendorNotConfiguredError("FMP permissions unavailable"))
+    yahoo_call = mock.Mock(return_value="Yahoo ETF data")
+    monkeypatch.setitem(interface.VENDOR_METHODS, "get_etf_fundamentals", {"fmp": fmp_call, "yfinance": yahoo_call})
+    set_config({"data_vendors": {"fundamental_data": "fmp"}})
+    with pytest.raises(VendorNotConfiguredError):
+        interface.route_to_vendor("get_etf_fundamentals", "SPY", "2026-09-19")
+    yahoo_call.assert_not_called()
+    set_config({"tool_vendors": {"get_etf_fundamentals": "fmp,yfinance"}})
+    assert interface.route_to_vendor("get_etf_fundamentals", "SPY", "2026-09-19") == "Yahoo ETF data"
+    assert fmp_call.call_count == 2 and yahoo_call.call_count == 1
+
+
+def test_etf_yahoo_fund_data_for_local_default(monkeypatch):
+    from datetime import datetime, timedelta
+    from types import SimpleNamespace
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from tradingagents.dataflows import yahoo
+
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    ticker = mock.Mock()
+    ticker.get_info.return_value = {"quoteType": "ETF", "longName": "Test fund", "currency": "USD"}
+    ticker.funds_data = SimpleNamespace(
+        description="Index exposure", fund_overview={"family": "Manager"},
+        fund_operations=pd.DataFrame({"SPY": [0.0009]}, index=["Annual Report Expense Ratio"]),
+        top_holdings=pd.DataFrame({"Name": ["Apple"], "Holding Percent": [0.07]}, index=["AAPL"]),
+        sector_weightings={"technology": 0.3}, asset_classes={"stockPosition": 0.99},
+    )
+    fetch = mock.Mock(return_value=ticker)
+    monkeypatch.setattr(yahoo.yf, "Ticker", fetch)
+    report = interface.route_to_vendor("get_etf_fundamentals", "SPY", str(today))
+    assert "Provider: yfinance" in report and "0.0009" in report and "AAPL" in report
+    assert "dates unavailable" in report and "fraction" in report
+    with pytest.raises(NoMarketDataError):
+        yahoo.get_etf_fundamentals("SPY", str(today - timedelta(days=1)))
+    fetch.assert_called_once_with("SPY")
+
+
 def test_fmp_all_report_routes_indicators_identity_and_returns_without_yahoo(fmp_http, monkeypatch, tmp_path):
     from types import SimpleNamespace
 
@@ -301,3 +411,299 @@ def test_fmp_caches_and_explicit_fallback_are_provider_isolated(monkeypatch, tmp
     config["tool_vendors"]["get_stock_data"] = "fmp,marketstack"
     assert market_data.get_ohlcv("MSFT", "2026-06-01", "2026-06-10", config=config).attrs["provider"] == "marketstack"
     assert fetches["yfinance"].call_count == 1
+
+
+def test_industry_sec_cutoff_units_and_original_filing_metadata():
+    import json
+
+    from tradingagents.dataflows.industry.documents import sec_disclosures
+
+    calls = []
+    paragraph = "Our business segment manufactures products for customers with supplier capacity and inventory risks. " * 4
+    index = {"cik": "1045810", "name": "NVIDIA", "filings": {"recent": {
+        "form": ["10-Q", "10-K", "10-Q"], "filingDate": ["2026-08-26", "2026-02-25", "2026-05-20"],
+        "reportDate": ["2026-07-26", "2026-01-25", "2026-04-26"],
+        "accessionNumber": ["0001045810-26-000075", "0001045810-26-000010", "0001045810-26-000045"],
+        "primaryDocument": ["future.htm", "annual.htm", "quarter.htm"],
+    }, "files": []}}
+
+    class Client:
+        blocked = set()
+
+        def fetch(self, url, **kwargs):
+            calls.append(url)
+            if "submissions" in url:
+                body = json.dumps(index).encode()
+            elif "companyfacts" in url:
+                body = json.dumps({"cik": 1045810, "facts": {"us-gaap": {"InventoryNet": {"units": {"USD": [
+                    {"end": "2026-04-26", "filed": "2026-05-20", "val": 100},
+                    {"end": "2026-04-26", "filed": "2026-08-26", "val": 999},
+                ]}}}}}).encode()
+            else:
+                body = f"<html><body><p>{paragraph}</p></body></html>".encode()
+            return {"body": body, "retrieved_at": "2026-09-20T00:00:00Z"}
+
+    result = sec_disclosures(Client(), "1045810", "2026-06-01")
+    assert not any("future.htm" in url for url in calls)
+    assert len(result["evidence"]) == 3
+    assert result["evidence"][0]["published_at"] == "2026-02-25"
+    metric = result["evidence"][-1]["data"][0]
+    assert metric["unit"] == "USD" and [row["val"] for row in metric["observations"]] == [100]
+
+
+def test_industry_sec_older_submissions_shard():
+    import json
+
+    from tradingagents.dataflows.industry.documents import sec_disclosures
+
+    class Client:
+        blocked = set()
+
+        def fetch(self, url, **kwargs):
+            if "-submissions-" in url:
+                body = {"form": ["10-K"], "filingDate": ["2020-02-20"], "reportDate": ["2020-01-01"],
+                        "accessionNumber": ["0001045810-20-000001"], "primaryDocument": ["old.htm"]}
+            elif "submissions" in url:
+                body = {"cik": 1045810, "filings": {"recent": {"form": [], "filingDate": []},
+                        "files": [{"name": "CIK0001045810-submissions-001.json", "filingFrom": "2019-01-01", "filingTo": "2021-01-01"}]}}
+            else:
+                return {"body": b"<p>Our business segment has long term supplier arrangements and customer concentration risks in manufacturing.</p>", "retrieved_at": "now"}
+            return {"body": json.dumps(body).encode(), "retrieved_at": "now"}
+
+    result = sec_disclosures(Client(), "1045810", "2020-06-01", include_facts=False)
+    assert len(result["evidence"]) == 1 and result["evidence"][0]["period"] == "2020-01-01"
+
+
+def test_industry_public_file_parsers_preserve_units_and_revisions():
+    import io
+
+    from openpyxl import Workbook
+
+    from tradingagents.dataflows.industry.indicators import parse_census, parse_eia, parse_wsts
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Monthly Data"
+    sheet.append(["All numbers are in 1000 US$."])
+    sheet.append([2026])
+    sheet.append(["Worldwide", 100, 120, None])
+    sheet.append(["Americas", 20, 25, None])
+    stream = io.BytesIO()
+    workbook.save(stream)
+    result = parse_wsts(stream.getvalue(), "2026-02-28")
+    assert result["unit"] == "1000 USD" and result["latest_period"] == "2026-02"
+    assert len(result["observations"]) == 4
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Estimates in millions of dollars"])
+    sheet.append(["Industry", "", "Seasonally Adjusted", "", "Not Seasonally Adjusted"])
+    sheet.append(["", "", "July", "June", "May"])
+    sheet.append(["", "", "2026p", "2026r", "2026"])
+    sheet.append(["Construction machinery", "", 100, 90, 80])
+    sheet.append(["p Preliminary; r Revised. Semiconductor new orders excluded."])
+    stream = io.BytesIO()
+    workbook.save(stream)
+    result = parse_census(stream.getvalue(), "new_orders", "2026-09-20", "construction machinery")
+    assert result["latest_period"] == "2026-07" and len(result["rows"]) == 1
+    assert "2026p" in str(result["headers_by_column_position"])
+    assert "Semiconductor" in result["footnotes"][0]
+    data = b'STUB_1,STUB_2,9/11/26,9/4/26\nRefiner Inputs,Crude Oil Inputs,"17,330","17,586"\nRefiner Inputs,Percent Utilization,96.8,97.8\n'
+    result = parse_eia(data, "refining", "2026-09-20")
+    assert result["metrics"][0]["unit"] == "thousand barrels per day"
+    assert result["metrics"][1]["unit"] == "percent"
+    assert result["metrics"][0]["observations"][0]["value"] == 17330
+
+
+def test_industry_historical_official_files_do_not_fetch_current_vintages():
+    from unittest.mock import Mock
+
+    from tradingagents.dataflows.industry.indicators import collect_indicators
+
+    client = Mock()
+    result = collect_indicators(client, "Semiconductors", "2020-01-15", {"wsts"}, live=False)
+    assert not result["evidence"] and result["failures"][0]["source"] == "wsts"
+    client.fetch.assert_not_called()
+    result = collect_indicators(client, "Software - Infrastructure", "2026-09-20", {"eia", "census", "wsts"}, live=True)
+    assert not result["evidence"]
+    client.fetch.assert_not_called()
+
+
+def test_industry_related_companies_are_bounded_across_calls(monkeypatch, tmp_path):
+    from tradingagents.dataflows.industry import IndustryResearch
+    from tradingagents.dataflows.industry.transport import SourceUnavailable
+
+    research = IndustryResearch("NVDA", "2026-01-15", {"data_cache_dir": str(tmp_path), "industry_sources": [], "industry_max_related_companies": 3})
+    research.context = {"evidence": [], "candidate_peers": [{"symbol": s} for s in ("AMD", "TSM", "MU", "AAPL")]}
+    monkeypatch.setattr(research, "_profile", lambda symbol: {"companyName": symbol})
+    monkeypatch.setattr(research, "_company", lambda symbol, **kwargs: {"ticker": symbol, "evidence": []})
+    assert len(research.get_related_company_evidence(["AMD", "TSM"])["companies"]) == 2
+    second = research.get_related_company_evidence(["MU", "AAPL"])
+    assert second["checked_symbols"] == ["AMD", "MU", "TSM"]
+    assert second["rejected"][0]["symbol"] == "AAPL"
+    assert len(research.get_related_company_evidence(["AMD"])["companies"]) == 1
+    with pytest.raises(SourceUnavailable):
+        research.get_related_company_evidence(["AMD", "TSM", "MU", "AAPL"])
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_industry_sec_denial_stops_requests_and_does_not_log_contact(monkeypatch, tmp_path, caplog, status):
+    import requests
+
+    from tradingagents.dataflows.industry.transport import DocumentClient, SourceUnavailable
+
+    monkeypatch.setenv("SEC_USER_AGENT", "IndustryTests private-contact@example.com")
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("8.8.8.8", 443))])
+    calls = []
+
+    def respond(session, url, **kwargs):
+        calls.append(url)
+        response = requests.Response()
+        response.status_code = status
+        response._content = b"denied"
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.Session, "get", respond)
+    client = DocumentClient({"data_cache_dir": str(tmp_path)})
+    for _ in range(2):
+        with pytest.raises(SourceUnavailable):
+            client.fetch("https://data.sec.gov/submissions/CIK0001045810.json", source="sec")
+    assert len(calls) == 1 and "private-contact" not in caplog.text
+
+
+def test_industry_extract_preserves_named_relationships_in_later_sections():
+    import json
+
+    from tradingagents.dataflows.industry.documents import extract_document
+
+    noise = '<p>General supplier inventory risk and customer demand may change over time in our business operations.</p>' * 100
+    html = (noise + '<h2>Manufacturing</h2><p>We utilize foundries such as Named Foundry Company to produce wafers. '
+            'We purchase memory from Named Memory Corporation and engage independent contract manufacturers.</p>'
+            '<h2>Our current competitors include:</h2><p>Suppliers of hardware and software for processors such as Named Competitor '
+            'Corporation provide competing platforms for our principal markets.</p>')
+    result = extract_document({"body": html.encode()}, budget=8000)
+    assert "Named Foundry Company" in json.dumps(result["supply_chain"])
+    assert "Named Competitor" in json.dumps(result["competition"])
+
+
+def test_industry_fmp_entitlement_failure_is_per_dataset(fmp_http, tmp_path):
+    from tradingagents.dataflows.errors import VendorNotConfiguredError
+    from tradingagents.dataflows.industry import IndustryResearch
+
+    def respond(endpoint, params):
+        if endpoint == "revenue-product-segmentation":
+            return 402, {"error": "subscription upgrade required"}
+        return 200, [{"symbol": "CAT", "companyName": "Caterpillar"}]
+
+    fmp_http.respond = respond
+    research = IndustryResearch("CAT", "2026-01-15", {"data_cache_dir": str(tmp_path), "industry_sources": ["fmp"]})
+    with pytest.raises(VendorNotConfiguredError):
+        research._fmp_rows("statements", "revenue_product_segmentation", symbol="CAT")
+    assert research._profile("CAT")["companyName"] == "Caterpillar"
+    assert research._fmp_rows("company", "stock_peers", symbol="CAT")
+
+    research = IndustryResearch("CAT", "2026-01-15", {"data_cache_dir": str(tmp_path), "industry_sources": ["fmp"]})
+    research.live = True
+    context = research.get_industry_context()
+    failure = next(row for row in context["failures"] if row["dataset"] == "revenue-product-segmentation")
+    assert failure["code"] == "subscription_required" and "HTTP 402" in failure["reason"]
+    assert "not configured" not in failure["reason"]
+    assert context["company"] == "Caterpillar"
+
+
+def test_industry_fmp_diagnostics_distinguish_config_and_permissions(fmp_http, monkeypatch, tmp_path, caplog):
+    from tradingagents.dataflows.errors import VendorError, VendorNotConfiguredError
+    from tradingagents.dataflows.industry import IndustryResearch, source_failure
+
+    for status, code in ((401, "authentication_failed"), (402, "subscription_required"), (403, "access_denied")):
+        fmp_http.respond = lambda endpoint, params, status=status: (status, {"error": "apikey=upstream-secret"})
+        research = IndustryResearch("CRCL", "2026-01-15", {"data_cache_dir": str(tmp_path), "industry_sources": ["fmp"]})
+        context = research.get_industry_context()
+        failure = next(row for row in context["failures"] if row["dataset"] == "profile")
+        assert failure["code"] == code and str(status) in failure["reason"]
+        assert "upstream-secret" not in str(context) + caplog.text
+
+    monkeypatch.delenv("FMP_API_KEY")
+    calls_before = len(fmp_http.calls)
+    research = IndustryResearch("CRCL", "2026-01-15", {"data_cache_dir": str(tmp_path), "industry_sources": ["fmp"]})
+    context = research.get_industry_context()
+    failure = next(row for row in context["failures"] if row["dataset"] == "profile")
+    assert failure["code"] == "missing_api_key" and len(fmp_http.calls) == calls_before
+    assert source_failure("fmp", VendorNotConfiguredError("Install the project's pinned fmpsdk dependency"), dataset="profile")["code"] == "missing_dependency"
+    assert source_failure("fmp", VendorError("secret"), dataset="profile")["reason"] == "VendorError"
+
+
+def test_industry_sec_only_related_lookup_and_etf_guard(monkeypatch, tmp_path):
+    import json
+
+    from tradingagents.dataflows.industry import IndustryResearch, UnsupportedIndustryAsset
+
+    research = IndustryResearch("NVDA", "2026-01-15", {"data_cache_dir": str(tmp_path), "industry_sources": ["sec"]})
+    research.context = {"evidence": [{"data": {"excerpts": {"supply_chain": [
+        {"text": "We purchase memory from Micron Technology, Inc."},
+    ]}}}], "candidate_peers": []}
+    monkeypatch.setattr(research.client, "fetch", lambda url, **kwargs: {"body": json.dumps({
+        "0": {"ticker": "MU", "cik_str": 723125, "title": "MICRON TECHNOLOGY INC"},
+    }).encode()})
+    monkeypatch.setattr("tradingagents.dataflows.industry.sec_disclosures", lambda *a, **k: {
+        "issuer": "MICRON", "cik": "0000723125", "sic": "3674", "sic_description": "Semiconductors",
+        "evidence": [], "failures": [],
+    })
+    result = research.get_related_company_evidence(["MU"])
+    assert not result["rejected"]
+    assert result["companies"][0]["cik"] == "0000723125"
+    assert not result["companies"][0]["failures"]
+    research = IndustryResearch("SPY", "2026-01-15", {"data_cache_dir": str(tmp_path), "industry_sources": ["fmp", "sec"]})
+    monkeypatch.setattr(research, "_fmp_rows", lambda *a, **k: [{"symbol": "SPY", "isEtf": True}])
+    monkeypatch.setattr(research.client, "fetch", lambda *a, **k: pytest.fail("ETF must not fetch SEC documents"))
+    with pytest.raises(UnsupportedIndustryAsset):
+        research.get_industry_context()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "server_error"])
+def test_industry_transport_retries_once_and_caches_without_contact(monkeypatch, tmp_path, failure):
+    import requests
+
+    from tradingagents.dataflows.industry.transport import DocumentClient, SourceUnavailable
+
+    monkeypatch.setenv("SEC_USER_AGENT", "IndustryTests contact-private@example.com")
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("8.8.8.8", 443))])
+    monkeypatch.setattr("tradingagents.dataflows.industry.transport.time.sleep", lambda seconds: None)
+    statuses = [failure, 200, failure, failure]
+    calls = []
+
+    def respond(session, url, **kwargs):
+        calls.append(url)
+        status = statuses.pop(0)
+        if status == "timeout":
+            raise requests.Timeout("upstream-private-details")
+        response = requests.Response()
+        response.status_code = 503 if status == "server_error" else status
+        response._content = b'{"public": true}'
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.Session, "get", respond)
+    client = DocumentClient({"data_cache_dir": str(tmp_path)})
+    url = "https://data.sec.gov/submissions/CIK0001045810.json"
+    first = client.fetch(url, source="sec")
+    assert first["body"] == b'{"public": true}' and len(calls) == 2
+    assert client.fetch(url, source="sec")["cache_hit"] and len(calls) == 2
+    for path in (tmp_path / "industry").glob("*.json"):
+        assert "contact-private" not in path.read_text()
+    with pytest.raises(SourceUnavailable) as error:
+        client.fetch("https://data.sec.gov/submissions/CIK0000789019.json", source="sec")
+    assert len(calls) == 4 and "upstream-private-details" not in str(error.value)
+
+
+def test_industry_missing_sec_contact_does_not_make_requests(monkeypatch, tmp_path):
+    import requests
+
+    from tradingagents.dataflows.industry.transport import DocumentClient, SourceUnavailable
+
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    monkeypatch.delenv("COMMERCE_SUPPORT_EMAIL", raising=False)
+    monkeypatch.setattr(requests.Session, "get", lambda *a, **k: pytest.fail("Missing SEC contact must fail before I/O"))
+    with pytest.raises(SourceUnavailable, match="contact email"):
+        DocumentClient({"data_cache_dir": str(tmp_path)}).fetch(
+            "https://data.sec.gov/submissions/CIK0001045810.json", source="sec")

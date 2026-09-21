@@ -31,6 +31,7 @@ from tradingagents.commerce.creem import (
     verify_signature,
 )
 from tradingagents.commerce.observability import log_event, trace_id
+from tradingagents.commerce.profile import get_etf_allowlist
 from tradingagents.commerce.service import CommerceRuntime, CommerceService
 from tradingagents.commerce.store import CommerceStore
 
@@ -166,6 +167,7 @@ def create_app(settings: CommerceSettings | None = None, *, service: CommerceSer
         return templates.TemplateResponse(request=request, name="index.html", context={
             "languages": LANGUAGES, "available": available, "support_email": settings.support_email,
             "product": product,
+            "etf_symbols": get_etf_allowlist(service.base_config) if service.base_config["etf_reports_enabled"] else (),
             "recaptcha_site_key": settings.recaptcha_site_key if settings.recaptcha_enabled else "",
         }, status_code=200 if product else 503)
 
