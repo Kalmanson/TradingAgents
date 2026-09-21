@@ -317,7 +317,7 @@ def commerce(tmp_path):
                 if self.ambiguous_checkout:
                     raise requests.ReadTimeout("upstream-private-payload")
                 body = {"id": "ch_" + uuid.uuid4().hex, "mode": "test", "product": "prod_report",
-                        "request_id": kwargs["json"]["request_id"], "checkout_url": "https://checkout.creem.io/test-session"}
+                        "checkout_url": "https://checkout.creem.io/test-session"}
             elif url.endswith("/v1/checkouts") and method == "GET":
                 body = deepcopy(self.lookup_checkout)
             elif url.endswith("/emails"):
@@ -793,7 +793,6 @@ def test_commerce_logs_correlate_delivery_without_sensitive_data(commerce, caplo
 @pytest.mark.integration
 @pytest.mark.parametrize("field,value,failed_check", [
     ("id", None, "checkout_id_present"),
-    ("request_id", "wrong_order", "request_id_matches"),
     ("mode", "prod", "mode_matches"),
     ("mode", None, "mode_matches"),
     ("product", "prod_other", "product_id_matches"),

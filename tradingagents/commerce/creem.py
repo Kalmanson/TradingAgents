@@ -62,6 +62,11 @@ def entity_id(value) -> str | None:
     return value if isinstance(value, str) and 0 < len(value) <= 128 else None
 
 
+def is_number(value) -> bool:
+    """官方 schema 中金额与数量字段均为 number 类型，int 与 float 都合法；bool 不算。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 class CreemClient:
     def __init__(self, settings: CommerceSettings, transport=None):
         self.settings = settings
@@ -127,7 +132,7 @@ class CreemClient:
                 raw = self._request("GET", "/v1/products", params={"product_id": self.settings.product_id})
                 currency = raw.get("currency")
                 if (entity_id(raw) != self.settings.product_id
-                        or type(raw.get("price")) is not int or raw["price"] <= 0
+                        or not is_number(raw.get("price")) or raw["price"] <= 0
                         or not isinstance(currency, str) or not re.fullmatch(r"[A-Za-z]{3}", currency)
                         or raw.get("billing_type") != "onetime"
                         or raw.get("tax_mode") not in ("inclusive", "exclusive")
@@ -162,9 +167,10 @@ class CreemClient:
                          and not url.username and not url.password)
         except (TypeError, ValueError, AttributeError):
             valid_url = False
+        # 按官方 API 规范，创建收银台的响应不回显 request_id（仅在 webhook 对象与
+        # GET /v1/checkouts 的查询结果中返回），此处只校验响应确实存在的字段。
         checks = {
             "checkout_id_present": bool(entity_id(result)),
-            "request_id_matches": result.get("request_id") == order["id"],
             "mode_matches": result.get("mode") == self.settings.creem_mode,
             "product_id_matches": entity_id(result.get("product")) == order["product_id"],
             "checkout_url_valid": bool(valid_url),
@@ -172,14 +178,14 @@ class CreemClient:
         if not all(checks.values()):
             log_event(logger, "checkout_validation_failed", level=logging.WARNING, order_id=order["id"],
                       failed_checks=[name for name, passed in checks.items() if not passed],
-                      expected={"request_id": order["id"], "product_id": order["product_id"],
+                      expected={"product_id": order["product_id"],
                                 "mode": self.settings.creem_mode}, response=result)
             raise CheckoutUncertain("Payment service returned an unexpected checkout.")
         return result
 
     def _validate_product(self, product: dict, order: dict) -> None:
         if (entity_id(product) != order["product_id"]
-                or type(product.get("price")) is not int or product["price"] != order["amount"]
+                or not is_number(product.get("price")) or product["price"] != order["amount"]
                 or product.get("currency", "").upper() != order["currency"]
                 or product.get("billing_type") != "onetime"
                 or product.get("tax_mode") != order["tax_mode"]
@@ -218,24 +224,24 @@ class CreemClient:
         paid = remote_order.get("amount_paid", remote_order.get("amount"))
         due = remote_order.get("amount_due", remote_order.get("amount"))
         tax = remote_order.get("tax_amount", 0)
-        if type(tax) is not int or tax < 0 or order["tax_mode"] not in {"inclusive", "exclusive"}:
+        if not is_number(tax) or tax < 0 or order["tax_mode"] not in {"inclusive", "exclusive"}:
             raise PaymentRejected("Invalid payment tax information.")
         expected_total = order["amount"] + tax if order["tax_mode"] == "exclusive" else order["amount"]
         expected_subtotal = expected_total - tax
         if (expected_subtotal < 0
-                or ("sub_total" in remote_order and (type(remote_order["sub_total"]) is not int
+                or ("sub_total" in remote_order and (not is_number(remote_order["sub_total"])
                                                      or remote_order["sub_total"] != expected_subtotal))):
             raise PaymentRejected("Payment subtotal does not match the order's saved price.")
         if (checkout.get("status") != "completed"
                 or checkout.get("mode") != self.settings.creem_mode
-                or type(checkout.get("units", 1)) is not int or checkout.get("units", 1) != 1
+                or not is_number(checkout.get("units", 1)) or checkout.get("units", 1) != 1
                 or remote_order.get("status") != "paid"
                 or remote_order.get("type") != "onetime"
                 or remote_order.get("mode", self.settings.creem_mode) != self.settings.creem_mode
                 or entity_id(remote_order.get("product")) != order["product_id"]
                 or remote_order.get("currency", "").upper() != order["currency"]
-                or type(paid) is not int or paid != expected_total
-                or type(due) is not int or due != expected_total
+                or not is_number(paid) or paid != expected_total
+                or not is_number(due) or due != expected_total
                 or remote_order.get("discount_amount", 0) not in (None, 0)
                 or checkout.get("subscription")):
             raise PaymentRejected("Payment does not match this purchase.")
