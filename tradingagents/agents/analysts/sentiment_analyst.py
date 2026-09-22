@@ -35,6 +35,10 @@ from tradingagents.agents.utils.agent_utils import (
     get_language_instruction,
     get_news,
 )
+from tradingagents.agents.utils.news_data_tools import (
+    NEWS_UNAVAILABLE_PREFIX,
+    with_news_data_warning,
+)
 from tradingagents.agents.utils.structured import (
     NO_EXTERNAL_TOOLS,
     bind_structured,
@@ -64,9 +68,8 @@ def create_sentiment_analyst(llm):
         start_date = _seven_days_back(end_date)
         instrument_context = get_instrument_context_from_state(state)
 
-        # Pre-fetch all three sources. Each fetcher degrades gracefully and
-        # returns a string (no exceptions surface from here), so the LLM
-        # always sees something — either real data or a clear placeholder.
+        # Expected source failures become explicit placeholders. Programming
+        # errors still surface instead of being mistaken for missing evidence.
         news_block = get_news.func(ticker, start_date, end_date)
         # Pass the analysis window so a historical run trims social posts to it
         # instead of leaking today's chatter into a backtest (#1220).
@@ -118,6 +121,8 @@ def create_sentiment_analyst(llm):
             render_sentiment_report,
             "Sentiment Analyst",
         )
+        if isinstance(news_block, str) and news_block.startswith(NEWS_UNAVAILABLE_PREFIX):
+            report_text = with_news_data_warning(report_text, ["get_news"])
 
         return {
             "messages": [AIMessage(content=report_text)],
@@ -174,7 +179,7 @@ Community discussion. Engagement signal via upvote score and comment count. Subr
 
 5. **Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.
 
-6. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If the sources are silent on a given subreddit, say so.
+6. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" or "NEWS_DATA_UNAVAILABLE" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. Missing news does not mean no events or neutral sentiment. Continue with available sources; never invent missing headlines, events, or citations. If the sources are silent on a given subreddit, say so.
 
 7. **Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, macro headlines, etc.
 
